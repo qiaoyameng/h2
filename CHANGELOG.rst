@@ -1,6 +1,20 @@
 Release History
 ===============
 
+4.5.0 (unreleased)
+------------------
+
+**API Changes (Backward Compatible)**
+
+- Added optional manual acknowledgement of received SETTINGS frames. When
+  ``H2Configuration`` is created with ``manual_settings_ack=True``, h2 no
+  longer emits the SETTINGS acknowledgement automatically. Instead, the
+  ``RemoteSettingsChanged`` event carries an opaque ``ack_token`` and the
+  application calls the new ``H2Connection.acknowledge_settings`` method
+  with that token to emit the acknowledgement. Received settings values
+  still take effect immediately upon receipt; only the acknowledgement
+  frame is deferred. The default behaviour is unchanged.
+
 4.4.1 (2026-08-03)
 ------------------
 
