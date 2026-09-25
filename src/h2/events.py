@@ -660,6 +660,40 @@ class UnknownFrameReceived(Event):
         return "<UnknownFrameReceived>"
 
 
+@dataclass(**kw_only)
+class OriginReceived(Event):
+    """
+    The OriginReceived event is fired when the remote peer sends an ORIGIN
+    frame, as defined by `RFC 8336 <https://tools.ietf.org/html/rfc8336>`_.
+    This frame is used by servers to assert the origins for which the
+    connection is authoritative.
+
+    This event can only be fired on the client end of a connection, and only
+    for ORIGIN frames received on stream 0: servers ignore ORIGIN frames, and
+    ORIGIN frames on any other stream are invalid and ignored, as required by
+    RFC 8336.
+
+    .. warning:: The origins carried by this event are *asserted* by the
+                 server: h2 does not (and cannot) verify that the server is
+                 actually authoritative for them. In particular, h2 has no
+                 insight into TLS certificate validation. Before reusing this
+                 connection for any of these origins, users must confirm that
+                 the server is authoritative for the origin, as described in
+                 RFC 8336 Section 2.4.
+
+    .. versionadded:: 4.5.0
+    """
+
+    #: The origins asserted by the server in this ORIGIN frame, as serialized
+    #: origins in the form defined by `RFC 6454 Section 6.2
+    #: <https://tools.ietf.org/html/rfc6454#section-6.2>`_. May be empty.
+    origins: list[bytes]
+
+    def __repr__(self) -> str:
+        origins = [origin.decode("utf-8", "ignore") for origin in self.origins]
+        return f"<OriginReceived origins:{origins}>"
+
+
 def _bytes_representation(data: bytes | None) -> str | None:
     """
     Converts a bytestring into something that is safe to print on all Python

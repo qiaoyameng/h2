@@ -10,9 +10,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from hyperframe.exceptions import InvalidDataError, InvalidFrameError
-from hyperframe.frame import ContinuationFrame, Frame, HeadersFrame, PushPromiseFrame
+from hyperframe.frame import (
+    ContinuationFrame,
+    ExtensionFrame,
+    Frame,
+    HeadersFrame,
+    PushPromiseFrame,
+)
 
 from .exceptions import FrameDataMissingError, FrameTooLargeError, ProtocolError
+from .frame import OriginFrame
 
 if TYPE_CHECKING:  # pragma: no cover
     from ._typing import Buffer
@@ -134,6 +141,12 @@ class FrameBuffer:
         except (InvalidDataError, InvalidFrameError) as err:  # pragma: no cover
             msg = f"Received frame with invalid header: {err!s}"
             raise ProtocolError(msg) from err
+
+        # hyperframe does not know the ORIGIN frame (RFC 8336) and represents
+        # it as a generic ExtensionFrame. Re-wrap it in our own frame class so
+        # that its payload gets appropriately parsed and validated.
+        if isinstance(f, ExtensionFrame) and f.type == OriginFrame.type:
+            f = OriginFrame(stream_id=f.stream_id)
 
         # Next, check that we have enough length to parse the frame body. If
         # not, bail, leaving the frame header data in the buffer for next time.

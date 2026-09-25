@@ -1,6 +1,19 @@
 Release History
 ===============
 
+4.5.0 (Unreleased)
+------------------
+
+**API Changes (Backward Compatible)**
+
+- Added support for the ORIGIN frame defined by RFC 8336. Servers can send it
+  with the new ``H2Connection.send_origin`` method; clients receive the new
+  ``OriginReceived`` event and can inspect the origins asserted by the server
+  via the new ``H2Connection.declared_origins`` property. Note that h2 only
+  reports the origins asserted by the server: whether the connection may be
+  reused for them depends on TLS certificate validation, which is out of
+  scope for h2.
+
 4.4.1 (2026-08-03)
 ------------------
 

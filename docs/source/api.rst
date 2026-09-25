@@ -80,6 +80,9 @@ Events
 .. autoclass:: h2.events.AlternativeServiceAvailable
    :members:
 
+.. autoclass:: h2.events.OriginReceived
+   :members:
+
 .. autoclass:: h2.events.UnknownFrameReceived
    :members:
 

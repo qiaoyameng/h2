@@ -36,6 +36,7 @@ from .events import (
     ConnectionTerminated,
     Event,
     InformationalResponseReceived,
+    OriginReceived,
     PingAckReceived,
     PingReceived,
     PriorityUpdated,
@@ -59,6 +60,7 @@ from .exceptions import (
     StreamIDTooLowError,
     TooManyStreamsError,
 )
+from .frame import OriginFrame, validate_origin
 from .frame_buffer import FrameBuffer
 from .settings import ChangedSetting, SettingCodes, Settings
 from .stream import H2Stream, StreamClosedBy
@@ -101,6 +103,8 @@ class ConnectionInputs(Enum):
     RECV_PRIORITY = 17
     SEND_ALTERNATIVE_SERVICE = 18  # Added in 2.3.0
     RECV_ALTERNATIVE_SERVICE = 19  # Added in 2.3.0
+    SEND_ORIGIN = 20  # Added in 4.5.0
+    RECV_ORIGIN = 21  # Added in 4.5.0
 
 
 class AllowedStreamIDs(IntEnum):
@@ -158,6 +162,10 @@ class H2ConnectionStateMachine:
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.IDLE, ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
             (None, ConnectionState.CLIENT_OPEN),
+        (ConnectionState.IDLE, ConnectionInputs.SEND_ORIGIN):
+            (None, ConnectionState.SERVER_OPEN),
+        (ConnectionState.IDLE, ConnectionInputs.RECV_ORIGIN):
+            (None, ConnectionState.CLIENT_OPEN),
 
         # State: open, client side.
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_HEADERS):
@@ -197,6 +205,8 @@ class H2ConnectionStateMachine:
         (ConnectionState.CLIENT_OPEN,
             ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
                 (None, ConnectionState.CLIENT_OPEN),
+        (ConnectionState.CLIENT_OPEN, ConnectionInputs.RECV_ORIGIN):
+            (None, ConnectionState.CLIENT_OPEN),
 
         # State: open, server side.
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_HEADERS):
@@ -239,6 +249,8 @@ class H2ConnectionStateMachine:
         (ConnectionState.SERVER_OPEN,
             ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
                 (None, ConnectionState.SERVER_OPEN),
+        (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_ORIGIN):
+            (None, ConnectionState.SERVER_OPEN),
 
         # State: closed
         (ConnectionState.CLOSED, ConnectionInputs.SEND_GOAWAY):
@@ -401,6 +413,11 @@ class H2Connection:
             max_window_size=self.local_settings.initial_window_size,
         )
 
+        # The set of origins the remote server has asserted authority for
+        # using ORIGIN frames (RFC 8336). Only populated to be read via the
+        # ``declared_origins`` property.
+        self._declared_origins: set[bytes] = set()
+
         # When in doubt use dict-dispatch.
         self._frame_dispatch_table: dict[type[Frame], Callable] = {  # type: ignore
             HeadersFrame: self._receive_headers_frame,
@@ -414,6 +431,7 @@ class H2Connection:
             GoAwayFrame: self._receive_goaway_frame,
             ContinuationFrame: self._receive_naked_continuation,
             AltSvcFrame: self._receive_alt_svc_frame,
+            OriginFrame: self._receive_origin_frame,
             ExtensionFrame: self._receive_unknown_frame,
         }
 
@@ -459,6 +477,27 @@ class H2Connection:
         """
         inbound_numbers = int(not self.config.client_side)
         return self._open_streams(inbound_numbers)
+
+    @property
+    def declared_origins(self) -> frozenset[bytes]:
+        """
+        The set of origins the remote server has asserted authority for by
+        sending ORIGIN frames, as defined by `RFC 8336
+        <https://tools.ietf.org/html/rfc8336>`_. This set grows monotonically
+        as ORIGIN frames are received: repeated assertions of the same origin
+        do not change it.
+
+        .. warning:: These origins are *asserted* by the server: h2 does not
+                     (and cannot) verify that the server is actually
+                     authoritative for them. In particular, h2 has no insight
+                     into TLS certificate validation. Before reusing this
+                     connection for any of these origins, users must confirm
+                     that the server is authoritative for the origin, as
+                     described in RFC 8336 Section 2.4.
+
+        .. versionadded:: 4.5.0
+        """
+        return frozenset(self._declared_origins)
 
     @property
     def inbound_flow_control_window(self) -> int:
@@ -1207,6 +1246,49 @@ class H2Connection:
             frames = stream.advertise_alternative_service(field_value)
 
         self._prepare_for_sending(frames)
+
+    def send_origin(self, origins: Iterable[bytes | str]) -> None:
+        """
+        Send an ORIGIN frame on this connection, as defined by `RFC 8336
+        <https://tools.ietf.org/html/rfc8336>`_. This frame asserts to the
+        client that this connection is authoritative for the given origins.
+
+        ORIGIN frames are sent by servers only, on stream 0: calling this
+        method on a client connection raises ``ProtocolError``.
+
+        Each origin must be a valid serialized origin as defined by `RFC 6454
+        Section 6.2 <https://tools.ietf.org/html/rfc6454#section-6.2>`_ (for
+        example ``b"https://example.com"``): invalid origins raise
+        ``ValueError``.
+
+        .. versionadded:: 4.5.0
+
+        :param origins: The origins to assert authority for.
+        :type origins: iterable of ``bytes`` or ``str``
+
+        :returns: Nothing.
+        """
+        if self.config.client_side:
+            msg = "Clients MUST NOT send ORIGIN frames."
+            raise ProtocolError(msg)
+
+        serialized_origins = []
+        for origin in origins:
+            if isinstance(origin, str):
+                try:
+                    origin = origin.encode("ascii")
+                except UnicodeEncodeError as err:
+                    msg = f"Origin must be ASCII: {origin!r}"
+                    raise ValueError(msg) from err
+            if not isinstance(origin, bytes) or not validate_origin(origin):
+                msg = f"Invalid origin: {origin!r}"
+                raise ValueError(msg)  # noqa: TRY004
+            serialized_origins.append(origin)
+
+        self.state_machine.process_input(ConnectionInputs.SEND_ORIGIN)
+
+        f = OriginFrame(stream_id=0, origins=serialized_origins)
+        self._prepare_for_sending([f])
 
     def prioritize(self,
                    stream_id: int,
@@ -1966,6 +2048,37 @@ class H2Connection:
             events.append(event)
 
         return frames, events
+
+    def _receive_origin_frame(self, frame: OriginFrame) -> tuple[list[Frame], list[Event]]:
+        """
+        An ORIGIN frame has been received. This frame, specified in RFC 8336,
+        is used by servers to assert the origins for which the connection is
+        authoritative.
+
+        RFC 8336 requires that this frame is sent by servers on stream 0:
+        servers MUST ignore ORIGIN frames, and ORIGIN frames on any other
+        stream are invalid and MUST be ignored. Ignored frames do not
+        transition the connection state machine.
+        """
+        if not self.config.client_side:
+            self.config.logger.debug("Ignoring ORIGIN frame received by server")
+            return [], []
+
+        if frame.stream_id != 0:
+            self.config.logger.debug(
+                "Ignoring ORIGIN frame on non-zero stream %d", frame.stream_id,
+            )
+            return [], []
+
+        self.state_machine.process_input(ConnectionInputs.RECV_ORIGIN)
+
+        # The declared origins are the union of the origins asserted by all
+        # ORIGIN frames received on this connection: asserting an origin that
+        # was already asserted does not constitute a new authorization.
+        self._declared_origins.update(frame.origins)
+
+        event = OriginReceived(origins=list(frame.origins))
+        return [], [event]
 
     def _receive_unknown_frame(self, frame: ExtensionFrame) -> tuple[list[Frame], list[Event]]:
         """

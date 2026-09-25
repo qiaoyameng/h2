@@ -18,6 +18,8 @@ from hyperframe.frame import (
     WindowUpdateFrame,
 )
 
+from h2.frame import OriginFrame
+
 SAMPLE_SETTINGS = {
     SettingsFrame.HEADER_TABLE_SIZE: 4096,
     SettingsFrame.ENABLE_PUSH: 1,
@@ -179,6 +181,12 @@ class FrameFactory:
         f.origin = origin
         f.field = field
         return f
+
+    def build_origin_frame(self, origins, stream_id=0):
+        """
+        Builds a single ORIGIN frame.
+        """
+        return OriginFrame(stream_id=stream_id, origins=origins)
 
     def change_table_size(self, new_size) -> None:
         """
