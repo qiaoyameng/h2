@@ -364,6 +364,10 @@ class RemoteSettingsChanged(Event):
        Prior to this version the user needed to acknowledge settings changes.
        This is no longer the case: h2 now automatically acknowledges
        them.
+
+    .. versionchanged:: 4.5.0
+       Added the ``ack_token`` attribute, used when manual settings
+       acknowledgement is enabled.
     """
 
     def __init__(self) -> None:
@@ -371,6 +375,19 @@ class RemoteSettingsChanged(Event):
         #: :class:`ChangedSetting <h2.settings.ChangedSetting>`, representing
         #: the changed settings.
         self.changed_settings: dict[int, ChangedSetting] = {}
+
+        #: A token uniquely identifying the acknowledgement owed for this
+        #: settings change. This is only set when manual settings
+        #: acknowledgement is enabled (see the ``manual_settings_ack``
+        #: configuration option): in that case the application must pass this
+        #: token to
+        #: :meth:`H2Connection.acknowledge_settings
+        #: <h2.connection.H2Connection.acknowledge_settings>` to emit the
+        #: SETTINGS acknowledgement frame. When automatic acknowledgement is
+        #: in use, this is ``None``.
+        #:
+        #: .. versionadded:: 4.5.0
+        self.ack_token: int | None = None
 
     @classmethod
     def from_settings(cls,

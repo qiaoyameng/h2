@@ -149,6 +149,22 @@ class H2Configuration:
         .. versionadded:: 2.6.0
 
     :type logger: ``logging.Logger``
+
+    :param manual_settings_ack: Controls whether received SETTINGS frames are
+        acknowledged automatically. When ``False`` (the default), h2 emits
+        the SETTINGS acknowledgement frame immediately. When ``True``, the
+        acknowledgement is deferred: the
+        :class:`RemoteSettingsChanged <h2.events.RemoteSettingsChanged>` event
+        carries a unique ``ack_token``, and the application must call
+        :meth:`H2Connection.acknowledge_settings
+        <h2.connection.H2Connection.acknowledge_settings>` with that token to
+        emit the acknowledgement. The new setting values themselves take
+        effect immediately upon receipt, as required by RFC 7540: only the
+        ACK frame is delayed.
+
+        .. versionadded:: 4.5.0
+
+    :type manual_settings_ack: ``bool``
     """
 
     client_side = _BooleanConfigOption("client_side")
@@ -167,6 +183,9 @@ class H2Configuration:
     normalize_inbound_headers = _BooleanConfigOption(
         "normalize_inbound_headers",
     )
+    manual_settings_ack = _BooleanConfigOption(
+        "manual_settings_ack",
+    )
 
     def __init__(self,
                  client_side: bool = True,
@@ -176,6 +195,7 @@ class H2Configuration:
                  split_outbound_cookies: bool = False,
                  validate_inbound_headers: bool = True,
                  normalize_inbound_headers: bool = True,
+                 manual_settings_ack: bool = False,
                  logger: DummyLogger | OutputLogger | None = None) -> None:
         self.client_side = client_side
         self.header_encoding = header_encoding
@@ -184,6 +204,7 @@ class H2Configuration:
         self.split_outbound_cookies = split_outbound_cookies
         self.validate_inbound_headers = validate_inbound_headers
         self.normalize_inbound_headers = normalize_inbound_headers
+        self.manual_settings_ack = manual_settings_ack
         self.logger = logger or DummyLogger(__name__)
 
     @property

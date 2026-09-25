@@ -7,6 +7,8 @@ An implementation of a HTTP/2 connection.
 from __future__ import annotations
 
 import base64
+import itertools
+from collections import deque
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any
 
@@ -106,6 +108,13 @@ class ConnectionInputs(Enum):
 class AllowedStreamIDs(IntEnum):
     EVEN = 0
     ODD = 1
+
+
+# A process-wide counter used to generate the tokens that identify pending
+# SETTINGS acknowledgements when manual settings acknowledgement is enabled.
+# Drawing from a single shared counter ensures that a token issued by one
+# connection can never be valid on another connection.
+_settings_ack_token_counter = itertools.count(1)
 
 
 class H2ConnectionStateMachine:
@@ -386,6 +395,12 @@ class H2Connection:
         # Data that needs to be sent.
         self._data_to_send = bytearray()
 
+        # Tokens identifying received SETTINGS frames whose acknowledgement
+        # has been deferred because manual settings acknowledgement is
+        # enabled. Acknowledgements must be emitted in receipt order, so this
+        # is a FIFO queue. Unused in automatic acknowledgement mode.
+        self._pending_settings_acks: deque[int] = deque()
+
         # Keeps track of how streams are closed.
         # Used to ensure that we don't blow up in the face of frames that were
         # in flight when a RST_STREAM was sent.
@@ -593,6 +608,10 @@ class H2Connection:
             f = SettingsFrame(0)
             f.parse_body(memoryview(settings_header))
             self._receive_settings_frame(f)
+            # The ACK for the settings carried in the HTTP2-Settings header
+            # is deliberately thrown away, so no acknowledgement may remain
+            # pending for it in manual acknowledgement mode either.
+            self._pending_settings_acks.clear()
 
         # Set up appropriate state. Stream 1 in a half-closed state:
         # half-closed(local) for clients, half-closed(remote) for servers.
@@ -1127,6 +1146,55 @@ class H2Connection:
         s.settings = new_settings
         self._prepare_for_sending([s])
 
+    def acknowledge_settings(self, token: int) -> None:
+        """
+        Acknowledge a previously received SETTINGS frame, emitting the
+        SETTINGS acknowledgement frame.
+
+        This is only valid when manual settings acknowledgement is enabled
+        via the ``manual_settings_ack`` configuration option. The ``token``
+        must be the ``ack_token`` from the oldest unacknowledged
+        :class:`RemoteSettingsChanged <h2.events.RemoteSettingsChanged>`
+        event: acknowledgements are emitted in the order the SETTINGS frames
+        were received. Tokens that have already been acknowledged, that
+        belong to a different connection, or that are otherwise unknown are
+        rejected.
+
+        Note that the new setting values take effect as soon as the SETTINGS
+        frame is received: this method only controls when the acknowledgement
+        frame is emitted.
+
+        .. versionadded:: 4.5.0
+
+        :param token: The ``ack_token`` from the
+            :class:`RemoteSettingsChanged <h2.events.RemoteSettingsChanged>`
+            event being acknowledged.
+        :type token: ``int``
+        """
+        if not self.config.manual_settings_ack:
+            msg = (
+                "Cannot manually acknowledge settings: "
+                "manual_settings_ack is not enabled"
+            )
+            raise ProtocolError(msg)
+
+        if not self._pending_settings_acks:
+            msg = f"Unknown settings acknowledgement token: {token}"
+            raise ProtocolError(msg)
+
+        if self._pending_settings_acks[0] != token:
+            msg = (
+                f"Settings acknowledgement token {token} is not the oldest "
+                f"outstanding token: acknowledgements must be made in order"
+            )
+            raise ProtocolError(msg)
+
+        self._pending_settings_acks.popleft()
+        self.state_machine.process_input(ConnectionInputs.SEND_SETTINGS)
+        f = SettingsFrame(0)
+        f.flags.add("ACK")
+        self._prepare_for_sending([f])
+
     def advertise_alternative_service(self,
                                       field_value: bytes | str,
                                       origin: bytes | None = None,
@@ -1443,7 +1511,22 @@ class H2Connection:
         self.state_machine.process_input(ConnectionInputs.SEND_SETTINGS)
 
         changes = self.remote_settings.acknowledge()
+        self._apply_remote_settings_changes(changes)
 
+        f = SettingsFrame(0)
+        f.flags.add("ACK")
+        return [f]
+
+    def _apply_remote_settings_changes(self,
+                                       changes: dict[SettingCodes | int, ChangedSetting]) -> None:
+        """
+        Apply the side effects of newly received remote settings values.
+
+        These changes take effect as soon as the SETTINGS frame is received,
+        regardless of when the acknowledgement is emitted: in particular, a
+        reduced flow control window or maximum frame size immediately
+        constrains what this peer may send.
+        """
         if SettingCodes.INITIAL_WINDOW_SIZE in changes:
             setting = changes[SettingCodes.INITIAL_WINDOW_SIZE]
             self._flow_control_change_from_settings(
@@ -1462,10 +1545,6 @@ class H2Connection:
             self.max_outbound_frame_size = setting.new_value
             for stream in self.streams.values():
                 stream.max_outbound_frame_size = setting.new_value
-
-        f = SettingsFrame(0)
-        f.flags.add("ACK")
-        return [f]
 
     def _flow_control_change_from_settings(self, old_value: int | None, new_value: int) -> None:
         """
@@ -1780,11 +1859,22 @@ class H2Connection:
         for setting, value in frame.settings.items():
             self.remote_settings.validate_received_setting(setting, value)
         self.remote_settings.update(frame.settings)
-        events.append(
-            RemoteSettingsChanged.from_settings(
-                self.remote_settings, frame.settings,
-            ),
+        event = RemoteSettingsChanged.from_settings(
+            self.remote_settings, frame.settings,
         )
+        events.append(event)
+
+        if self.config.manual_settings_ack:
+            # The new values take effect immediately, as required by RFC
+            # 7540: only the emission of the acknowledgement frame is
+            # deferred until the application acknowledges this event.
+            changes = self.remote_settings.acknowledge()
+            self._apply_remote_settings_changes(changes)
+            token = next(_settings_ack_token_counter)
+            self._pending_settings_acks.append(token)
+            event.ack_token = token
+            return [], events
+
         frames = self._acknowledge_settings()
 
         return frames, events

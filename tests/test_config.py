@@ -22,6 +22,7 @@ class TestH2Config:
         config = h2.config.H2Configuration()
         assert config.client_side
         assert config.header_encoding is None
+        assert not config.manual_settings_ack
         assert isinstance(config.logger, h2.config.DummyLogger)
 
     boolean_config_options = [
@@ -30,6 +31,7 @@ class TestH2Config:
         "normalize_outbound_headers",
         "validate_inbound_headers",
         "normalize_inbound_headers",
+        "manual_settings_ack",
     ]
 
     @pytest.mark.parametrize("option_name", boolean_config_options)
