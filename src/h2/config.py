@@ -149,6 +149,19 @@ class H2Configuration:
         .. versionadded:: 2.6.0
 
     :type logger: ``logging.Logger``
+
+    :param max_queued_data_bytes: The maximum total number of bytes of
+        outbound data that may be buffered internally at any one time by the
+        data queueing interface (:meth:`H2Connection.queue_data
+        <h2.connection.H2Connection.queue_data>`), summed across all streams
+        on a single connection. When this limit is reached, further calls to
+        ``queue_data`` will only accept part of the offered data, and will
+        report how much was accepted. This bound ensures that the queueing
+        interface cannot buffer data without limit. Defaults to 1 MiB.
+
+        .. versionadded:: 4.5.0
+
+    :type max_queued_data_bytes: ``int``
     """
 
     client_side = _BooleanConfigOption("client_side")
@@ -176,7 +189,8 @@ class H2Configuration:
                  split_outbound_cookies: bool = False,
                  validate_inbound_headers: bool = True,
                  normalize_inbound_headers: bool = True,
-                 logger: DummyLogger | OutputLogger | None = None) -> None:
+                 logger: DummyLogger | OutputLogger | None = None,
+                 max_queued_data_bytes: int = 1024 * 1024) -> None:
         self.client_side = client_side
         self.header_encoding = header_encoding
         self.validate_outbound_headers = validate_outbound_headers
@@ -185,6 +199,7 @@ class H2Configuration:
         self.validate_inbound_headers = validate_inbound_headers
         self.normalize_inbound_headers = normalize_inbound_headers
         self.logger = logger or DummyLogger(__name__)
+        self.max_queued_data_bytes = max_queued_data_bytes
 
     @property
     def header_encoding(self) -> bool | str | None:
@@ -210,3 +225,22 @@ class H2Configuration:
             msg = "header_encoding cannot be True"
             raise ValueError(msg)
         self._header_encoding = value
+
+    @property
+    def max_queued_data_bytes(self) -> int:
+        """
+        The maximum total number of bytes of outbound data that may be
+        buffered internally by the data queueing interface across all streams
+        on a single connection. Must be a non-negative integer.
+        """
+        return self._max_queued_data_bytes
+
+    @max_queued_data_bytes.setter
+    def max_queued_data_bytes(self, value: int) -> None:
+        """
+        Enforces constraints on the queued data byte limit.
+        """
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            msg = "max_queued_data_bytes must be a non-negative int"
+            raise ValueError(msg)  # noqa: TRY004
+        self._max_queued_data_bytes = value
