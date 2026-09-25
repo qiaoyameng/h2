@@ -55,6 +55,14 @@ class SettingCodes(enum.IntEnum):
     #: client set this to 1.
     ENABLE_CONNECT_PROTOCOL = SettingsFrame.ENABLE_CONNECT_PROTOCOL
 
+    #: This setting, defined by RFC 9218, indicates that the sender does not
+    #: use the RFC 7540 priority scheme (the dependency tree), and instead
+    #: uses the extensible prioritization scheme. To indicate this, set this
+    #: to 1.
+    #:
+    #: .. versionadded:: 4.5.0
+    NO_RFC7540_PRIORITIES = 0x9
+
 
 def _setting_code_from_int(code: int) -> SettingCodes | int:
     """
@@ -261,6 +269,20 @@ class Settings(MutableMapping[SettingCodes | int, int]):
     def enable_connect_protocol(self, value: int) -> None:
         self[SettingCodes.ENABLE_CONNECT_PROTOCOL] = value
 
+    @property
+    def no_rfc7540_priorities(self) -> int:
+        """
+        The current value of the :data:`NO_RFC7540_PRIORITIES
+        <h2.settings.SettingCodes.NO_RFC7540_PRIORITIES>` setting.
+
+        .. versionadded:: 4.5.0
+        """
+        return self.get(SettingCodes.NO_RFC7540_PRIORITIES, 0)
+
+    @no_rfc7540_priorities.setter
+    def no_rfc7540_priorities(self, value: int) -> None:
+        self[SettingCodes.NO_RFC7540_PRIORITIES] = value
+
     # Implement the MutableMapping API.
     def __getitem__(self, key: SettingCodes | int) -> int:
         val = self._settings[key][0]
@@ -358,6 +380,10 @@ def _validate_setting(
         if value < 0:
             return ErrorCodes.PROTOCOL_ERROR
     elif setting == SettingCodes.ENABLE_CONNECT_PROTOCOL and value not in (0, 1):
+        return ErrorCodes.PROTOCOL_ERROR
+    elif setting == SettingCodes.NO_RFC7540_PRIORITIES and value not in (0, 1):
+        # RFC 9218 section 4.1: values other than 0 or 1 MUST be treated as
+        # a connection error of type PROTOCOL_ERROR.
         return ErrorCodes.PROTOCOL_ERROR
 
     return ErrorCodes.NO_ERROR

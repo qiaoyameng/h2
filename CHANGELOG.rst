@@ -1,6 +1,19 @@
 Release History
 ===============
 
+4.5.0 (unreleased)
+------------------
+
+**API Changes (Backward Compatible)**
+
+- Added support for RFC 9218 (Extensible Prioritization Scheme for HTTP):
+  the ``SETTINGS_NO_RFC7540_PRIORITIES`` setting
+  (``h2.settings.SettingCodes.NO_RFC7540_PRIORITIES``), the
+  ``PRIORITY_UPDATE`` frame, the ``H2Connection.priority_update`` method for
+  sending priority updates, and the ``h2.events.PriorityUpdateReceived``
+  event, which carries the parsed urgency and incremental information to the
+  application. The RFC 7540 priority tree interface is unchanged.
+
 4.4.1 (2026-08-03)
 ------------------
 

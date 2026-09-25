@@ -559,6 +559,53 @@ class PriorityUpdated(Event):
         )
 
 
+class PriorityUpdateReceived(Event):
+    """
+    The PriorityUpdateReceived event is fired whenever the remote peer sends
+    a PRIORITY_UPDATE frame, as defined by `RFC 9218
+    <https://www.rfc-editor.org/rfc/rfc9218>`_. This frame carries priority
+    information for the extensible prioritization scheme, in the form of an
+    urgency and an incremental flag.
+
+    This event is purely advisory, and does not need to be acted on. h2 does
+    not retain the priority information carried by this event: it is passed
+    to the application, which is responsible for any scheduling decisions.
+
+    .. versionadded:: 4.5.0
+    """
+
+    def __init__(self) -> None:
+        #: The ID of the stream the PRIORITY_UPDATE frame was received on.
+        #: This is ``0`` for frames sent by a client, and the ID of a push
+        #: stream for frames sent by a server.
+        self.stream_id: int | None = None
+
+        #: The ID of the element being prioritized. For frames sent by a
+        #: client this identifies a request stream; for frames sent by a
+        #: server it identifies a promised (push) stream.
+        self.prioritized_element_id: int | None = None
+
+        #: The raw Priority field value, as defined by RFC 9218 Section 4.
+        self.priority_field_value: bytes | None = None
+
+        #: The urgency of the prioritized element: an integer between ``0``
+        #: (most urgent) and ``7`` (least urgent). Defaults to ``3`` when the
+        #: field value does not carry a valid urgency.
+        self.urgency: int | None = None
+
+        #: Whether the prioritized element is incremental. Defaults to
+        #: ``False`` when the field value does not carry a valid incremental
+        #: flag.
+        self.incremental: bool | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"<PriorityUpdateReceived stream_id:{self.stream_id}, "
+            f"prioritized_element_id:{self.prioritized_element_id}, "
+            f"urgency:{self.urgency}, incremental:{self.incremental}>"
+        )
+
+
 class ConnectionTerminated(Event):
     """
     The ConnectionTerminated event is fired when a connection is torn down by

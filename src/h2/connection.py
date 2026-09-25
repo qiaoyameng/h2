@@ -29,6 +29,11 @@ from hyperframe.frame import (
     WindowUpdateFrame,
 )
 
+from ._rfc9218 import (
+    PriorityUpdateFrame,
+    parse_priority_field_value,
+    serialize_priority_field_value,
+)
 from .config import H2Configuration
 from .errors import ErrorCodes, _error_code_from_int
 from .events import (
@@ -38,6 +43,7 @@ from .events import (
     InformationalResponseReceived,
     PingAckReceived,
     PingReceived,
+    PriorityUpdateReceived,
     PriorityUpdated,
     RemoteSettingsChanged,
     RequestReceived,
@@ -411,6 +417,7 @@ class H2Connection:
             PingFrame: self._receive_ping_frame,
             RstStreamFrame: self._receive_rst_stream_frame,
             PriorityFrame: self._receive_priority_frame,
+            PriorityUpdateFrame: self._receive_priority_update_frame,
             GoAwayFrame: self._receive_goaway_frame,
             ContinuationFrame: self._receive_naked_continuation,
             AltSvcFrame: self._receive_alt_svc_frame,
@@ -1288,6 +1295,91 @@ class H2Connection:
 
         self._prepare_for_sending([frame_prio])
 
+    def priority_update(self,
+                        stream_id: int,
+                        prioritized_element_id: int | None = None,
+                        *,
+                        urgency: int = 3,
+                        incremental: bool = False,
+                        priority_field_value: bytes | None = None) -> None:
+        """
+        Notify the remote peer about the priority of a stream, using the
+        extensible prioritization scheme defined by `RFC 9218
+        <https://www.rfc-editor.org/rfc/rfc9218>`_.
+
+        This method sends a PRIORITY_UPDATE frame. Clients send this frame
+        on stream 0, identifying the request stream being prioritized with
+        ``prioritized_element_id``. Servers send this frame on a push stream
+        to reprioritize the promised stream: in that case
+        ``prioritized_element_id`` defaults to the ID of the push stream.
+
+        .. note:: Priority information is strictly advisory. Peers are
+                  allowed to disregard it entirely. Avoid relying on the idea
+                  that your priority signaling will definitely be obeyed.
+
+        .. note:: h2 does not implement a scheduler: it only transports the
+                  priority information. Acting on it is left to the
+                  application.
+
+        .. versionadded:: 4.5.0
+
+        :param stream_id: The ID of the stream to send the frame on. Must be
+            ``0`` for clients, and the ID of a push stream for servers.
+        :type stream_id: ``int``
+
+        :param prioritized_element_id: The ID of the element being
+            prioritized. Required for clients, where it identifies a request
+            stream. For servers it defaults to ``stream_id``.
+        :type prioritized_element_id: ``int`` or ``None``
+
+        :param urgency: The urgency of the element: an integer between ``0``
+            (most urgent) and ``7`` (least urgent). Defaults to ``3``.
+        :type urgency: ``int``
+
+        :param incremental: Whether the element is incremental. Defaults to
+            ``False``.
+        :type incremental: ``bool``
+
+        :param priority_field_value: If given, the raw Priority field value
+            to send, as defined by RFC 9218 Section 4. When provided,
+            ``urgency`` and ``incremental`` are ignored.
+        :type priority_field_value: ``bytes`` or ``None``
+        """
+        if self.config.client_side:
+            if stream_id != 0:
+                msg = "Clients MUST send PRIORITY_UPDATE on stream 0."
+                raise ProtocolError(msg)
+            if not prioritized_element_id:
+                msg = "Clients MUST provide a prioritized element ID."
+                raise ProtocolError(msg)
+        else:
+            if stream_id == 0:
+                msg = "Servers MUST NOT send PRIORITY_UPDATE on stream 0."
+                raise ProtocolError(msg)
+            if prioritized_element_id is None:
+                prioritized_element_id = stream_id
+
+        if priority_field_value is None:
+            if not 0 <= urgency <= 7:
+                msg = f"Urgency must be between 0 and 7, not {urgency}"
+                raise ProtocolError(msg)
+            priority_field_value = serialize_priority_field_value(
+                urgency, incremental,
+            )
+
+        self.state_machine.process_input(
+            ConnectionInputs.SEND_PRIORITY,
+        )
+
+        assert prioritized_element_id is not None
+        frame = PriorityUpdateFrame(
+            stream_id,
+            prioritized_element_id=prioritized_element_id,
+            priority_field_value=priority_field_value,
+        )
+
+        self._prepare_for_sending([frame])
+
     def local_flow_control_window(self, stream_id: int) -> int:
         """
         Returns the maximum amount of data that can be sent on stream
@@ -1886,6 +1978,64 @@ class H2Connection:
         if event.depends_on == frame.stream_id:
             msg = f"Stream {frame.stream_id} may not depend on itself"
             raise ProtocolError(msg)
+        events.append(event)
+
+        return [], events
+
+    def _receive_priority_update_frame(self, frame: PriorityUpdateFrame) -> tuple[list[Frame], list[Event]]:
+        """
+        Receive a PRIORITY_UPDATE frame on the connection.
+
+        This frame is defined by RFC 9218. Clients send it on stream 0 to
+        (re)prioritize request streams; servers send it on a push stream to
+        (re)prioritize the promised stream.
+        """
+        events = self.state_machine.process_input(
+            ConnectionInputs.RECV_PRIORITY,
+        )
+
+        if self.config.client_side:
+            # RFC 9218 section 6: a client that receives a PRIORITY_UPDATE
+            # frame on stream 0 MUST treat it as a connection error of type
+            # PROTOCOL_ERROR.
+            if frame.stream_id == 0:
+                msg = "Servers MUST NOT send PRIORITY_UPDATE on stream 0."
+                raise ProtocolError(msg)
+
+            # RFC 9218 section 6: a client that receives a PRIORITY_UPDATE
+            # frame on a stream that is not a push stream MUST treat it as a
+            # stream error of type PROTOCOL_ERROR. Push streams are
+            # server-initiated, and so have even stream IDs.
+            if frame.stream_id % 2 != 0:
+                try:
+                    stream = self._get_stream_by_id(frame.stream_id)
+                    frames = stream.reset_stream(ErrorCodes.PROTOCOL_ERROR)
+                except (NoSuchStreamError, StreamClosedError):
+                    rst_frame = RstStreamFrame(frame.stream_id)
+                    rst_frame.error_code = ErrorCodes.PROTOCOL_ERROR
+                    return [rst_frame], events
+                return frames, events
+        elif frame.stream_id != 0:
+            # RFC 9218 section 6: a server that receives a PRIORITY_UPDATE
+            # frame on a stream other than stream 0 MUST treat it as a
+            # connection error of type PROTOCOL_ERROR.
+            msg = "Clients MUST send PRIORITY_UPDATE on stream 0."
+            raise ProtocolError(msg)
+
+        # h2 does not retain priority information for streams that do not
+        # exist (yet or anymore): the priority information is simply passed
+        # to the application in this event, which bounds the amount of state
+        # a peer can cause us to keep.
+        urgency, incremental = parse_priority_field_value(
+            frame.priority_field_value,
+        )
+
+        event = PriorityUpdateReceived()
+        event.stream_id = frame.stream_id
+        event.prioritized_element_id = frame.prioritized_element_id
+        event.priority_field_value = frame.priority_field_value
+        event.urgency = urgency
+        event.incremental = incremental
         events.append(event)
 
         return [], events
