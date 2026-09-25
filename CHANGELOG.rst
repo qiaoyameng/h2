@@ -1,6 +1,28 @@
 Release History
 ===============
 
+4.5.0 (unreleased)
+------------------
+
+**API Changes (Backward Compatible)**
+
+- Added support for RFC 9218 (Extensible Prioritization Scheme for HTTP):
+
+  - The new ``SettingCodes.NO_RFC7540_PRIORITIES`` setting can be exchanged
+    to negotiate the extensible prioritization scheme.
+  - The new ``H2Connection.priority_update`` method sends PRIORITY_UPDATE
+    frames, carrying the ``urgency`` and ``incremental`` parameters.
+  - Received PRIORITY_UPDATE frames emit the new
+    ``h2.events.PriorityUpdateReceived`` event, which exposes the parsed
+    ``urgency`` and ``incremental`` parameters as well as the raw priority
+    field value. Unknown parameters in the field value are ignored, as the
+    RFC requires.
+  - h2 only transports this priority information: it does not retain
+    priority state for streams that do not exist, and it does not implement
+    a network scheduler on behalf of the application. The RFC 7540 priority
+    interface (``H2Connection.prioritize`` and
+    ``h2.events.PriorityUpdated``) is unchanged.
+
 4.4.1 (2026-08-03)
 ------------------
 
