@@ -365,6 +365,18 @@ class TestEventReprs:
         e = h2.events.UnknownFrameReceived(frame=hyperframe.frame.Frame(1))
         assert repr(e) == "<UnknownFrameReceived>"
 
+    def test_originreceived_repr(self) -> None:
+        """
+        OriginReceived has a useful debug representation.
+        """
+        e = h2.events.OriginReceived(
+            origins=[b"https://example.com", b"https://www.example.com"],
+        )
+        assert repr(e) == (
+            "<OriginReceived origins:"
+            "['https://example.com', 'https://www.example.com']>"
+        )
+
 
 def all_events():
     """

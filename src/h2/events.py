@@ -639,6 +639,48 @@ class AlternativeServiceAvailable(Event):
 
 
 @dataclass(**kw_only)
+class OriginReceived(Event):
+    """
+    The OriginReceived event is fired when the remote peer sends an ORIGIN
+    frame, defined in `RFC 8336 <https://www.rfc-editor.org/rfc/rfc8336>`_.
+
+    An ORIGIN frame declares a set of origins that the server asserts this
+    connection is, or could be, authoritative for. This event carries the
+    origins declared by a single ORIGIN frame. The accumulated set of all
+    origins declared on the connection so far is available as
+    :attr:`H2Connection.origin_set <h2.connection.H2Connection.origin_set>`.
+
+    .. warning:: These origins are only *claimed* by the server. h2 has no
+                 access to the TLS handshake, and so cannot verify that the
+                 server's certificate is valid for these origins. Per RFC
+                 8336 Section 2.4, a client must not use this connection for
+                 a claimed origin unless it has separately established that
+                 the server is authoritative for it (for example, via
+                 certificate validation). Do not treat this event alone as
+                 authorization to reuse the connection.
+
+    This event can only be fired on the client end of a connection.
+
+    .. versionadded:: 4.5.0
+    """
+
+    origins: list[bytes]
+    """
+    The valid origins declared by this ORIGIN frame, as bytestrings.
+
+    Origins in the frame that were not valid ASCII serializations of an
+    origin (per RFC 6454 Section 6.2) have been discarded, as required by
+    RFC 8336. Origins already present in the connection's origin set are
+    still reported here: this field reflects the content of this frame, not
+    the change to the connection's origin set.
+    """
+
+    def __repr__(self) -> str:
+        origins = [origin.decode("utf-8", "ignore") for origin in self.origins]
+        return f"<OriginReceived origins:{origins}>"
+
+
+@dataclass(**kw_only)
 class UnknownFrameReceived(Event):
     """
     The UnknownFrameReceived event is fired when the remote peer sends a frame
