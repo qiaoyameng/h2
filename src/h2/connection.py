@@ -61,7 +61,7 @@ from .exceptions import (
 )
 from .frame_buffer import FrameBuffer
 from .settings import ChangedSetting, SettingCodes, Settings
-from .stream import H2Stream, StreamClosedBy
+from .stream import H2Stream, StreamClosedBy, StreamInputs, StreamState
 from .utilities import SizeLimitDict, guard_increment_window
 from .windows import WindowManager
 
@@ -273,6 +273,24 @@ class H2ConnectionStateMachine:
             return []
 
 
+class _QueuedData:
+    """
+    Data queued on a single stream, waiting for flow control allowance to
+    become available. Used by
+    :meth:`H2Connection.queue_data <h2.connection.H2Connection.queue_data>`.
+    """
+
+    __slots__ = ("data", "end_stream")
+
+    def __init__(self) -> None:
+        #: The buffered data that has not yet been emitted in DATA frames.
+        self.data = bytearray()
+
+        #: Whether the stream should be ended once all buffered data has
+        #: been sent.
+        self.end_stream = False
+
+
 class H2Connection:
     """
     A low-level HTTP/2 connection object. This handles building and receiving
@@ -321,6 +339,10 @@ class H2Connection:
 
     # Keep in memory limited amount of results for streams closes
     MAX_CLOSED_STREAMS = 2**16
+
+    # The default maximum number of bytes that may be buffered by
+    # ``queue_data`` across all streams on this connection.
+    DEFAULT_MAX_BUFFERED_DATA_BYTES = 2**20
 
     def __init__(self, config: H2Configuration | None = None) -> None:
         self.state_machine = H2ConnectionStateMachine()
@@ -385,6 +407,20 @@ class H2Connection:
 
         # Data that needs to be sent.
         self._data_to_send = bytearray()
+
+        # Data queued via ``queue_data``, keyed by stream ID, waiting for
+        # flow control allowance. ``_queued_data_size`` tracks the total
+        # number of buffered bytes across all streams.
+        self._queued_data: dict[int, _QueuedData] = {}
+        self._queued_data_size = 0
+
+        #: The maximum number of bytes that may be buffered by
+        #: :meth:`queue_data <h2.connection.H2Connection.queue_data>` across
+        #: all streams on this connection. Attempts to queue more data than
+        #: this limit allows will only be partially accepted.
+        #:
+        #: .. versionadded:: 4.5.0
+        self.max_buffered_data_bytes = self.DEFAULT_MAX_BUFFERED_DATA_BYTES
 
         # Keeps track of how streams are closed.
         # Used to ensure that we don't blow up in the face of frames that were
@@ -876,6 +912,9 @@ class H2Connection:
         self.config.logger.debug(
             "Send data on stream ID %d with len %d", stream_id, len(data),
         )
+        if stream_id in self._queued_data:
+            msg = "Cannot mix send_data with queued data on the same stream"
+            raise ProtocolError(msg)
         frame_size = len(data)
         if pad_length is not None:
             if not isinstance(pad_length, int):
@@ -927,9 +966,191 @@ class H2Connection:
             that has been closed.
         """
         self.config.logger.debug("End stream ID %d", stream_id)
+        if stream_id in self._queued_data:
+            msg = "Cannot end a stream that has queued data: pass end_stream to queue_data instead"
+            raise ProtocolError(msg)
         self.state_machine.process_input(ConnectionInputs.SEND_DATA)
         frames = self._get_stream_by_id(stream_id).end_stream()
         self._prepare_for_sending(frames)
+
+    def queue_data(self,
+                   stream_id: int,
+                   data: bytes | memoryview,
+                   end_stream: bool = False,
+                   max_buffered_bytes: int | None = None) -> int:
+        """
+        Queue data to be sent on a given stream, letting h2 break it up into
+        DATA frames as flow control allowance permits.
+
+        Unlike :meth:`send_data <h2.connection.H2Connection.send_data>`, this
+        method does not require the caller to split the data to fit within
+        the flow control window or the maximum frame size. As much of the
+        data as currently fits within both the stream and connection flow
+        control windows is emitted immediately, split into frames no larger
+        than :data:`max_outbound_frame_size
+        <h2.connection.H2Connection.max_outbound_frame_size>`. The remainder
+        is buffered internally and emitted later, when WINDOW_UPDATE frames
+        or SETTINGS changes make room again.
+
+        The amount of buffered data is bounded: at most ``max_buffered_bytes``
+        (defaulting to :data:`max_buffered_data_bytes
+        <h2.connection.H2Connection.max_buffered_data_bytes>`) bytes are
+        buffered across all streams on this connection. If the buffer is
+        full, only part of the data is accepted: the number of bytes accepted
+        is returned, and the caller is responsible for re-queueing the rest
+        later (for example, in response to a :class:`WindowUpdated
+        <h2.events.WindowUpdated>` event).
+
+        If ``end_stream`` is ``True``, the stream is ended once all queued
+        data has been sent: the ``END_STREAM`` flag is set on the final DATA
+        frame emitted for this stream, and only on that frame. Note that
+        ``end_stream`` is only honoured if *all* of ``data`` was accepted: if
+        this method returns less than ``len(data)``, the caller must
+        re-queue the remaining data (passing ``end_stream`` again).
+
+        Queued data is discarded if the stream is reset by either peer, or if
+        the connection is terminated by a GOAWAY frame in either direction.
+
+        Do not mix this method with :meth:`send_data
+        <h2.connection.H2Connection.send_data>` or :meth:`end_stream
+        <h2.connection.H2Connection.end_stream>` on the same stream while
+        data is still queued: doing so raises a :class:`ProtocolError
+        <h2.exceptions.ProtocolError>`.
+
+        .. versionadded:: 4.5.0
+
+        :param stream_id: The ID of the stream on which to send the data.
+        :type stream_id: ``int``
+        :param data: The data to send on the stream.
+        :type data: ``bytes``
+        :param end_stream: (optional) Whether this is the last data to be
+            sent on the stream. Defaults to ``False``.
+        :type end_stream: ``bool``
+        :param max_buffered_bytes: (optional) The maximum total number of
+            bytes that may be buffered across all streams on this connection.
+            Defaults to :data:`max_buffered_data_bytes
+            <h2.connection.H2Connection.max_buffered_data_bytes>`.
+        :type max_buffered_bytes: ``int``
+        :returns: The number of bytes of ``data`` that were accepted.
+        :rtype: ``int``
+        """
+        self.config.logger.debug(
+            "Queue data on stream ID %d with len %d", stream_id, len(data),
+        )
+        self.state_machine.process_input(ConnectionInputs.SEND_DATA)
+        stream = self._get_stream_by_id(stream_id)
+        if stream.state_machine.state not in (
+            StreamState.OPEN, StreamState.HALF_CLOSED_REMOTE,
+        ):
+            # Let the stream state machine raise the appropriate error, just
+            # as it would if send_data had been called.
+            stream.state_machine.process_input(StreamInputs.SEND_DATA)
+
+        if max_buffered_bytes is None:
+            max_buffered_bytes = self.max_buffered_data_bytes
+        if max_buffered_bytes < 0:
+            msg = "max_buffered_bytes must be non-negative"
+            raise ValueError(msg)
+
+        queued = self._queued_data.get(stream_id)
+        if queued is not None and queued.end_stream:
+            msg = f"Stream {stream_id} has already been ended"
+            raise ProtocolError(msg)
+
+        accepted = min(
+            len(data), max_buffered_bytes - self._queued_data_size,
+        )
+        accepted = max(accepted, 0)
+
+        if accepted or (end_stream and accepted == len(data)):
+            if queued is None:
+                queued = self._queued_data[stream_id] = _QueuedData()
+            if accepted:
+                if isinstance(data, memoryview):
+                    data = data.tobytes()
+                queued.data += data[:accepted]
+                self._queued_data_size += accepted
+            # END_STREAM may only be set once the final chunk of data has
+            # been accepted into the queue.
+            if end_stream and accepted == len(data):
+                queued.end_stream = True
+
+        self._prepare_for_sending(self._drain_queued_data())
+        return accepted
+
+    def _drain_queued_data(self) -> list[Frame]:
+        """
+        Emit DATA frames for queued data, as far as the connection and stream
+        flow control windows (and the maximum frame size) currently allow.
+
+        Streams are serviced in a round-robin fashion, one frame at a time,
+        so that all streams with queued data share the connection flow
+        control window.
+        """
+        frames: list[Frame] = []
+
+        made_progress = True
+        while made_progress and self._queued_data:
+            made_progress = False
+            for stream_id, queued in list(self._queued_data.items()):
+                stream = self.streams.get(stream_id)
+                if stream is None or stream.closed:
+                    # The stream went away: its queued data can never be
+                    # sent, so drop it.
+                    self._discard_queued_data(stream_id)
+                    continue
+
+                if not queued.data:
+                    if queued.end_stream:
+                        # A zero-length DATA frame carries END_STREAM without
+                        # consuming any flow control allowance.
+                        frames.extend(stream.send_data(b"", end_stream=True))
+                        made_progress = True
+                    self._discard_queued_data(stream_id)
+                    continue
+
+                window = min(
+                    self.outbound_flow_control_window,
+                    stream.outbound_flow_control_window,
+                )
+                if window <= 0:
+                    continue
+
+                chunk_size = min(
+                    window, len(queued.data), self.max_outbound_frame_size,
+                )
+                chunk = bytes(queued.data[:chunk_size])
+                del queued.data[:chunk_size]
+                self._queued_data_size -= chunk_size
+
+                # END_STREAM goes only on the frame that carries the final
+                # queued byte.
+                end_stream = queued.end_stream and not queued.data
+                frames.extend(stream.send_data(chunk, end_stream=end_stream))
+                self.outbound_flow_control_window -= chunk_size
+                made_progress = True
+
+                if not queued.data:
+                    # The queue is empty: if end_stream was set, it was just
+                    # consumed by the final frame.
+                    del self._queued_data[stream_id]
+
+        return frames
+
+    def _discard_queued_data(self, stream_id: int) -> None:
+        """
+        Discard any data queued for a single stream.
+        """
+        queued = self._queued_data.pop(stream_id, None)
+        if queued is not None:
+            self._queued_data_size -= len(queued.data)
+
+    def _discard_all_queued_data(self) -> None:
+        """
+        Discard all queued data on all streams.
+        """
+        self._queued_data.clear()
+        self._queued_data_size = 0
 
     def increment_flow_control_window(self, increment: int, stream_id: int | None = None) -> None:
         """
@@ -1073,6 +1294,7 @@ class H2Connection:
         self.state_machine.process_input(ConnectionInputs.SEND_RST_STREAM)
         stream = self._get_stream_by_id(stream_id)
         frames = stream.reset_stream(error_code)
+        self._discard_queued_data(stream_id)
         self._prepare_for_sending(frames)
 
     def close_connection(self,
@@ -1095,6 +1317,9 @@ class H2Connection:
         """
         self.config.logger.debug("Close connection")
         self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
+
+        # Queued data can no longer be sent: drop it.
+        self._discard_all_queued_data()
 
         # Additional_data must be bytes
         if additional_data is not None:
@@ -1590,6 +1815,7 @@ class H2Connection:
         f.last_stream_id = self.highest_inbound_stream_id
         f.error_code = error_code
         self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
+        self._discard_all_queued_data()
         self._prepare_for_sending([f])
 
     def _receive_headers_frame(self, frame: HeadersFrame) -> tuple[list[Frame], list[Event]]:
@@ -1787,6 +2013,10 @@ class H2Connection:
         )
         frames = self._acknowledge_settings()
 
+        # Changes to INITIAL_WINDOW_SIZE or MAX_FRAME_SIZE may allow queued
+        # data to make progress again.
+        frames.extend(self._drain_queued_data())
+
         return frames, events
 
     def _receive_window_update_frame(self, frame: WindowUpdateFrame) -> tuple[list[Frame], list[Event]]:
@@ -1807,6 +2037,7 @@ class H2Connection:
                     frame.window_increment,
                 )
             except StreamClosedError:
+                self._discard_queued_data(frame.stream_id)
                 return [], events
         else:
             # Increment our local flow control window.
@@ -1819,6 +2050,9 @@ class H2Connection:
             window_updated_event = WindowUpdated(stream_id=0, delta=frame.window_increment)
             stream_events = [window_updated_event]
             frames = []
+
+        # New flow control allowance may let queued data make progress.
+        frames.extend(self._drain_queued_data())
 
         return frames, events + stream_events
 
@@ -1863,6 +2097,9 @@ class H2Connection:
         else:
             stream_frames, stream_events = stream.stream_reset(frame)
 
+        # Any data queued for this stream can no longer be sent.
+        self._discard_queued_data(frame.stream_id)
+
         return stream_frames, events + stream_events
 
     def _receive_priority_frame(self, frame: HeadersFrame | PriorityFrame) -> tuple[list[Frame], list[Event]]:
@@ -1900,6 +2137,7 @@ class H2Connection:
 
         # Clear the outbound data buffer: we cannot send further data now.
         self.clear_outbound_data_buffer()
+        self._discard_all_queued_data()
 
         # Fire an appropriate ConnectionTerminated event.
         new_event = ConnectionTerminated()

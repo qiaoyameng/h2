@@ -1,6 +1,17 @@
 Release History
 ===============
 
+Unreleased
+----------
+
+**API Changes (Backward Compatible)**
+
+- Added ``H2Connection.queue_data``, an optional alternative to ``send_data``
+  that buffers outbound data and emits DATA frames as flow control allowance
+  (both connection and stream windows) and the maximum frame size permit.
+  Buffered data is bounded by the configurable ``max_buffered_data_bytes``
+  limit, and the number of accepted bytes is reported to the caller.
+
 4.4.1 (2026-08-03)
 ------------------
 
