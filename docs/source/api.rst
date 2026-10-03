@@ -84,10 +84,24 @@ Events
    :members:
 
 
+Extension Frames
+----------------
+
+.. autoclass:: h2.extensions.ExtensionFrameHandler
+   :members:
+
+.. autoclass:: h2.extensions.StreamAssociation
+   :members:
+
+
 Exceptions
 ----------
 
 .. autoclass:: h2.exceptions.H2Error
+   :members:
+
+.. autoclass:: h2.exceptions.ExtensionApplicationError
+   :show-inheritance:
    :members:
 
 .. autoclass:: h2.exceptions.NoSuchStreamError
@@ -142,6 +156,10 @@ Protocol Errors
    :members:
 
 .. autoclass:: h2.exceptions.UnsupportedFrameError
+   :members:
+
+.. autoclass:: h2.exceptions.ExtensionProtocolError
+   :show-inheritance:
    :members:
 
 .. autoclass:: h2.exceptions.DenialOfServiceError

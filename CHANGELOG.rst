@@ -1,6 +1,18 @@
 Release History
 ===============
 
+4.5.0 (Unreleased)
+------------------
+
+**API Changes (Backward Compatible)**
+
+- Added an extension frame handler interface: ``H2Connection.register_extension_handler``
+  and ``H2Connection.send_extension_frame`` allow applications to send and receive
+  custom HTTP/2 extension frames without modifying h2's core frame dispatch.
+  Handlers are registered per connection, declare their stream association and
+  maximum payload size, and are only invoked after the core has validated the
+  frame. See ``h2.extensions`` for details.
+
 4.4.1 (2026-08-03)
 ------------------
 

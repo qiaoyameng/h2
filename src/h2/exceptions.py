@@ -161,6 +161,34 @@ class UnsupportedFrameError(ProtocolError):
     """
 
 
+class ExtensionProtocolError(ProtocolError):
+    """
+    An extension frame handler detected a violation of its extension
+    protocol. Raising this from
+    :meth:`ExtensionFrameHandler.handle_frame
+    <h2.extensions.ExtensionFrameHandler.handle_frame>` (or from any other
+    code processing extension frames) signals a connection error: h2 emits
+    a GOAWAY frame carrying :attr:`error_code` and raises this exception to
+    the caller of ``receive_data``.
+
+    .. versionadded:: 4.5.0
+    """
+
+
+class ExtensionApplicationError(H2Error):
+    """
+    An extension frame handler failed in an application-specific way: it
+    raised an exception that was not a
+    :class:`ProtocolError <h2.exceptions.ProtocolError>`.
+
+    This is purely an application error: h2 does not terminate the
+    connection, does not emit a GOAWAY frame, and does not change any core
+    connection state. The original exception is available as the cause of
+    this one.
+
+    .. versionadded:: 4.5.0
+    """
+
 
 class RFC1122Error(H2Error):
     """

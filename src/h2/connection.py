@@ -49,6 +49,7 @@ from .events import (
 )
 from .exceptions import (
     DenialOfServiceError,
+    ExtensionApplicationError,
     FlowControlError,
     FrameTooLargeError,
     NoAvailableStreamIDError,
@@ -59,6 +60,7 @@ from .exceptions import (
     StreamIDTooLowError,
     TooManyStreamsError,
 )
+from .extensions import ExtensionFrameHandler, StreamAssociation
 from .frame_buffer import FrameBuffer
 from .settings import ChangedSetting, SettingCodes, Settings
 from .stream import H2Stream, StreamClosedBy
@@ -71,6 +73,17 @@ if TYPE_CHECKING:  # pragma: no cover
     from hpack.struct import Header, HeaderWeaklyTyped
 
     from ._typing import Buffer
+
+# Frame types that are natively understood by h2 (via hyperframe). These
+# are reserved: extension frame handlers may not be registered for them.
+_RESERVED_FRAME_TYPES = frozenset(
+    frame_class.type
+    for frame_class in (
+        DataFrame, HeadersFrame, PriorityFrame, RstStreamFrame, SettingsFrame,
+        PushPromiseFrame, PingFrame, GoAwayFrame, WindowUpdateFrame,
+        ContinuationFrame, AltSvcFrame,
+    )
+)
 
 
 class ConnectionState(Enum):
@@ -416,6 +429,11 @@ class H2Connection:
             AltSvcFrame: self._receive_alt_svc_frame,
             ExtensionFrame: self._receive_unknown_frame,
         }
+
+        # Registered extension frame handlers, keyed by frame type. This is
+        # deliberately per-connection: registering a handler here has no
+        # effect on any other H2Connection.
+        self._extension_handlers: dict[int, ExtensionFrameHandler] = {}
 
     def _prepare_for_sending(self, frames: list[Frame]) -> None:
         if not frames:
@@ -1050,6 +1068,122 @@ class H2Connection:
         self.state_machine.process_input(ConnectionInputs.SEND_PING)
         f = PingFrame(0)
         f.opaque_data = opaque_data
+        self._prepare_for_sending([f])
+
+    def register_extension_handler(self, frame_type: int, handler: ExtensionFrameHandler) -> None:
+        """
+        Register a handler for a single HTTP/2 extension frame type on this
+        connection.
+
+        Once registered, frames of that type received on this connection are
+        validated by the core (frame length, CONTINUATION continuity,
+        connection state, and the handler's declared stream association and
+        payload limit) and then passed to the handler with an immutable
+        payload. Frames of that type received on any *other* connection are
+        unaffected: registration is strictly per-connection.
+
+        Handlers may not be registered for frame types defined by the core
+        HTTP/2 specification: those are always handled by h2 itself.
+
+        .. versionadded:: 4.5.0
+
+        :param frame_type: The frame type to handle, as an integer between
+            0 and 255 that is not reserved by the core specification.
+        :param handler: The handler to invoke for frames of this type.
+        :type handler: :class:`ExtensionFrameHandler
+            <h2.extensions.ExtensionFrameHandler>`
+        :returns: Nothing
+        """
+        if not isinstance(frame_type, int) or not 0 <= frame_type <= 0xFF:
+            msg = f"Invalid extension frame type: {frame_type!r}"
+            raise ValueError(msg)  # noqa: TRY004
+
+        if frame_type in _RESERVED_FRAME_TYPES:
+            msg = f"Cannot register an extension handler for reserved frame type {frame_type}"
+            raise ValueError(msg)
+
+        if frame_type in self._extension_handlers:
+            msg = f"An extension handler is already registered for frame type {frame_type}"
+            raise ValueError(msg)
+
+        if not callable(getattr(handler, "handle_frame", None)):
+            msg = "Extension handler must define a handle_frame method"
+            raise TypeError(msg)
+
+        if not isinstance(handler.stream_association, StreamAssociation):
+            msg = (
+                "Extension handler must declare a stream_association of "
+                "type StreamAssociation"
+            )
+            raise TypeError(msg)
+
+        max_payload_size = handler.max_payload_size
+        if (not isinstance(max_payload_size, int) or
+                isinstance(max_payload_size, bool) or
+                max_payload_size < 0):
+            msg = "Extension handler must declare a non-negative integer max_payload_size"
+            raise TypeError(msg)
+
+        self._extension_handlers[frame_type] = handler
+
+    def send_extension_frame(self,
+                             frame_type: int,
+                             stream_id: int = 0,
+                             flags: int = 0,
+                             payload: bytes = b"") -> None:
+        """
+        Send a single HTTP/2 extension frame.
+
+        A handler must have been registered for ``frame_type`` on this
+        connection via :meth:`register_extension_handler
+        <h2.connection.H2Connection.register_extension_handler>`: the
+        handler's declared constraints (stream association and payload
+        limit) are enforced on outbound frames exactly as they are on
+        inbound ones.
+
+        .. versionadded:: 4.5.0
+
+        :param frame_type: The extension frame type to send.
+        :param stream_id: The stream ID to send the frame on. Must be 0 for
+            connection-level extensions and nonzero for stream-level ones.
+        :param flags: The raw flag byte for the frame, as an integer.
+        :param payload: The frame payload.
+        :returns: Nothing
+        """
+        self.config.logger.debug(
+            "Send extension frame type %d on stream ID %d", frame_type, stream_id,
+        )
+
+        try:
+            handler = self._extension_handlers[frame_type]
+        except KeyError:
+            msg = f"No extension handler registered for frame type {frame_type}"
+            raise ValueError(msg) from None
+
+        if self.state_machine.state == ConnectionState.CLOSED:
+            msg = "Connection is closed."
+            raise ProtocolError(msg)
+
+        if not isinstance(stream_id, int) or not 0 <= stream_id <= 2**31 - 1:
+            msg = f"Invalid stream ID: {stream_id!r}"
+            raise ValueError(msg)  # noqa: TRY004
+
+        if not isinstance(flags, int) or not 0 <= flags <= 0xFF:
+            msg = f"Invalid flag byte: {flags!r}"
+            raise ValueError(msg)  # noqa: TRY004
+
+        payload = bytes(payload)
+        self._validate_extension_constraints(handler, stream_id, len(payload))
+
+        if len(payload) > self.max_outbound_frame_size:
+            msg = (
+                f"Extension frame payload of {len(payload)} bytes exceeds "
+                f"the maximum outbound frame size of {self.max_outbound_frame_size}"
+            )
+            raise FrameTooLargeError(msg)
+
+        f = ExtensionFrame(frame_type, stream_id, flag_byte=flags, body=payload)
+        f.body_len = len(payload)
         self._prepare_for_sending([f])
 
     def reset_stream(self, stream_id: int, error_code: ErrorCodes | int = 0) -> None:
@@ -1973,15 +2107,100 @@ class H2Connection:
         certainly an extension frame, though it's impossible to be entirely
         sure.
 
-        RFC 7540 § 5.5 says that we MUST ignore unknown frame types: so we
+        If a handler has been registered for this frame type on this
+        connection, the frame is validated and dispatched to it. Otherwise,
+        RFC 9113 § 5.5 says that we MUST ignore unknown frame types: so we
         do. We do notify the user that we received one, however.
         """
+        handler = self._extension_handlers.get(frame.type)
+        if handler is not None:
+            return self._receive_extension_frame(handler, frame)
+
         # All we do here is log.
         self.config.logger.debug(
             "Received unknown extension frame (ID %d)", frame.stream_id,
         )
         event = UnknownFrameReceived(frame=frame)
         return [], [event]
+
+    def _validate_extension_constraints(self,
+                                        handler: ExtensionFrameHandler,
+                                        stream_id: int,
+                                        payload_size: int) -> None:
+        """
+        Enforce the constraints declared by an extension frame handler: the
+        stream association and the maximum payload size. Raises
+        :class:`ProtocolError <h2.exceptions.ProtocolError>` or
+        :class:`FrameTooLargeError <h2.exceptions.FrameTooLargeError>` if
+        the frame violates them.
+        """
+        association = handler.stream_association
+        if association is StreamAssociation.CONNECTION and stream_id != 0:
+            msg = (
+                f"Connection-level extension frame on stream {stream_id}"
+            )
+            raise ProtocolError(msg)
+        if association is StreamAssociation.STREAM and stream_id == 0:
+            msg = "Stream-level extension frame on stream 0"
+            raise ProtocolError(msg)
+
+        if payload_size > handler.max_payload_size:
+            msg = (
+                f"Extension frame payload of {payload_size} bytes exceeds "
+                f"the handler limit of {handler.max_payload_size}"
+            )
+            raise FrameTooLargeError(msg)
+
+    def _receive_extension_frame(self,
+                                 handler: ExtensionFrameHandler,
+                                 frame: ExtensionFrame) -> tuple[list[Frame], list[Event]]:
+        """
+        Dispatch a received extension frame to its registered handler.
+
+        The core performs all of its validation before the handler is
+        invoked: the frame length has already been checked against the
+        connection-wide maximum frame size by the frame buffer, and
+        CONTINUATION continuity has already been enforced (a frame that
+        arrives in the middle of a header block never reaches this point).
+        Here we additionally check the connection state and the handler's
+        declared constraints. Only then is the handler called, with an
+        immutable payload.
+
+        No core connection state is changed by this method, so a handler
+        failure cannot leave a half-applied core state change behind. A
+        :class:`ProtocolError <h2.exceptions.ProtocolError>` from the
+        handler propagates and terminates the connection with GOAWAY; any
+        other exception is wrapped in
+        :class:`ExtensionApplicationError <h2.exceptions.ExtensionApplicationError>`
+        and raised with the connection left intact.
+        """
+        if self.state_machine.state == ConnectionState.CLOSED:
+            msg = "Received extension frame on a closed connection."
+            raise ProtocolError(msg)
+
+        self._validate_extension_constraints(handler, frame.stream_id, frame.body_len)
+
+        # The payload is handed to the extension as immutable bytes: it is
+        # a copy, never a view into the inbound buffer.
+        payload = bytes(frame.body)
+
+        try:
+            handler_events = handler.handle_frame(
+                self, frame.stream_id, frame.flag_byte, payload,
+            )
+        except ProtocolError:
+            # The extension signalled a protocol violation: this is a
+            # connection error, handled by the usual GOAWAY logic in
+            # receive_data.
+            raise
+        except Exception as e:  # noqa: BLE001
+            # Any other failure is an application error: the connection is
+            # left fully intact and usable.
+            msg = f"Extension handler for frame type {frame.type} failed: {e}"
+            raise ExtensionApplicationError(msg) from e
+
+        events = list(handler_events) if handler_events is not None else []
+        return [], events
 
     def _local_settings_acked(self) -> dict[SettingCodes | int, ChangedSetting]:
         """
