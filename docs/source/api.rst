@@ -77,6 +77,9 @@ Events
 .. autoclass:: h2.events.ConnectionTerminated
    :members:
 
+.. autoclass:: h2.events.GracefulShutdownReceived
+   :members:
+
 .. autoclass:: h2.events.AlternativeServiceAvailable
    :members:
 

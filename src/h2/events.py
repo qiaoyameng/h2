@@ -593,6 +593,32 @@ class ConnectionTerminated(Event):
         )
 
 
+class GracefulShutdownReceived(Event):
+    """
+    The GracefulShutdownReceived event is fired when the remote peer sends
+    the first GOAWAY frame of a graceful shutdown. Existing streams may still
+    be used, but new streams initiated by this endpoint will be rejected.
+    """
+
+    def __init__(self, *, last_stream_id: int, additional_data: bytes | None = None) -> None:
+        #: The last stream identifier acknowledged by the remote peer.
+        self.last_stream_id = last_stream_id
+
+        #: Additional debug data that can be appended to the GOAWAY frame.
+        self.additional_data = additional_data
+
+    def __repr__(self) -> str:
+        return (
+            "<GracefulShutdownReceived last_stream_id:{}, "
+            "additional_data:{}>".format(
+                self.last_stream_id,
+                _bytes_representation(
+                    self.additional_data[:20]
+                    if self.additional_data else None),
+            )
+        )
+
+
 class AlternativeServiceAvailable(Event):
     """
     The AlternativeServiceAvailable event is fired when the remote peer
