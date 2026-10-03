@@ -12,7 +12,12 @@ from typing import TYPE_CHECKING
 from hyperframe.exceptions import InvalidDataError, InvalidFrameError
 from hyperframe.frame import ContinuationFrame, Frame, HeadersFrame, PushPromiseFrame
 
-from .exceptions import FrameDataMissingError, FrameTooLargeError, ProtocolError
+from .exceptions import (
+    FrameDataMissingError,
+    FrameTooLargeError,
+    InboundBufferTooLargeError,
+    ProtocolError,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from ._typing import Buffer
@@ -34,12 +39,56 @@ class FrameBuffer:
     H2 frames.
     """
 
-    def __init__(self, server: bool = False) -> None:
+    def __init__(self, server: bool = False, max_buffer_size: int | None = None) -> None:
         self._data = bytearray()
         self.max_frame_size = 0
+        self.max_buffer_size = max_buffer_size
         self._preamble = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" if server else b""
         self._preamble_len = len(self._preamble)
         self._headers_buffer: list[HeadersFrame | ContinuationFrame | PushPromiseFrame] = []
+
+    @property
+    def buffered_data_length(self) -> int:
+        """
+        The total number of unprocessed bytes currently retained.
+        """
+        return (
+            len(self._data)
+            + self._preamble_len
+            + sum(9 + frame.body_len for frame in self._headers_buffer)
+        )
+
+    @property
+    def has_complete_frame(self) -> bool:
+        """
+        Whether the buffer currently contains a complete frame to parse.
+        """
+        if self._preamble_len:
+            return False
+        if len(self._data) < 9:
+            return False
+
+        try:
+            _, length = Frame.parse_frame_header(memoryview(self._data[:9]))
+        except (InvalidDataError, InvalidFrameError) as err:  # pragma: no cover
+            msg = f"Received frame with invalid header: {err!s}"
+            raise ProtocolError(msg) from err
+
+        return len(self._data) >= length + 9
+
+    @property
+    def in_header_block(self) -> bool:
+        """
+        Whether a HEADERS or PUSH_PROMISE block is awaiting completion.
+        """
+        return bool(self._headers_buffer)
+
+    @property
+    def waiting_for_preamble(self) -> bool:
+        """
+        Whether part of the connection preamble is still outstanding.
+        """
+        return bool(self._preamble_len)
 
     def add_data(self, data: Buffer) -> None:
         """
@@ -48,6 +97,17 @@ class FrameBuffer:
         :param data: A bytestring containing the byte buffer.
         """
         data_view = memoryview(data)
+        incoming_length = len(data_view)
+
+        if (
+            self.max_buffer_size is not None
+            and self.buffered_data_length + incoming_length > self.max_buffer_size
+        ):
+            msg = (
+                f"Inbound buffer would contain {self.buffered_data_length + incoming_length} "
+                f"bytes, exceeding the limit of {self.max_buffer_size}"
+            )
+            raise InboundBufferTooLargeError(msg)
 
         if self._preamble_len:
             data_len = len(data_view)
@@ -62,6 +122,66 @@ class FrameBuffer:
             self._preamble = self._preamble[of_which_preamble:]
 
         self._data += data_view
+
+    def _parse_next_frame(self) -> Frame | None:
+        """
+        Parse and consume the next complete wire frame.
+
+        A frame that starts or continues a header block is counted, even when
+        it is not yet ready to be yielded to the connection.
+        """
+        if not self.has_complete_frame:
+            return None
+
+        try:
+            f, length = Frame.parse_frame_header(memoryview(self._data[:9]))
+        except (InvalidDataError, InvalidFrameError) as err:  # pragma: no cover
+            msg = f"Received frame with invalid header: {err!s}"
+            raise ProtocolError(msg) from err
+
+        # Confirm the frame has an appropriate length.
+        self._validate_frame_length(length)
+
+        # Try to parse the frame body
+        try:
+            f.parse_body(memoryview(self._data[9:9+length]))
+        except InvalidDataError as err:
+            msg = "Received frame with non-compliant data"
+            raise ProtocolError(msg) from err
+        except InvalidFrameError as err:
+            msg = "Frame data missing or invalid"
+            raise FrameDataMissingError(msg) from err
+
+        # At this point, as we know we'll use or discard the entire frame, we
+        # can update the data.
+        del self._data[:9+length]
+
+        return self._update_header_buffer(f)
+
+    def next_frame(self) -> Frame | None:
+        """
+        Return the next frame that is ready for the connection, or ``None``.
+        """
+        frame, _ = self.parse_frames()
+        return frame
+
+    def parse_frames(self, frame_budget: int | None = None) -> tuple[Frame | None, int]:
+        """
+        Parse up to ``frame_budget`` wire frames and return the next logical
+        frame plus the number of wire frames consumed.
+        """
+        frames_parsed = 0
+
+        while frame_budget is None or frames_parsed < frame_budget:
+            if not self.has_complete_frame:
+                break
+
+            frame = self._parse_next_frame()
+            frames_parsed += 1
+            if frame is not None:
+                return frame, frames_parsed
+
+        return None, frames_parsed
 
     def _validate_frame_length(self, length: int) -> None:
         """
@@ -124,52 +244,7 @@ class FrameBuffer:
         return self
 
     def __next__(self) -> Frame:
-        # First, check that we have enough data to successfully parse the
-        # next frame header. If not, bail. Otherwise, parse it.
-        if len(self._data) < 9:
+        frame = self.next_frame()
+        if frame is None:
             raise StopIteration
-
-        try:
-            f, length = Frame.parse_frame_header(memoryview(self._data[:9]))
-        except (InvalidDataError, InvalidFrameError) as err:  # pragma: no cover
-            msg = f"Received frame with invalid header: {err!s}"
-            raise ProtocolError(msg) from err
-
-        # Next, check that we have enough length to parse the frame body. If
-        # not, bail, leaving the frame header data in the buffer for next time.
-        if len(self._data) < length + 9:
-            raise StopIteration
-
-        # Confirm the frame has an appropriate length.
-        self._validate_frame_length(length)
-
-        # Try to parse the frame body
-        try:
-            f.parse_body(memoryview(self._data[9:9+length]))
-        except InvalidDataError as err:
-            msg = "Received frame with non-compliant data"
-            raise ProtocolError(msg) from err
-        except InvalidFrameError as err:
-            msg = "Frame data missing or invalid"
-            raise FrameDataMissingError(msg) from err
-
-        # At this point, as we know we'll use or discard the entire frame, we
-        # can update the data.
-        # Deleting the consumed prefix mutates the bytearray in place instead
-        # of copying the remaining bytes into a new object, as slicing would.
-        # ``del s[i:j]`` is documented for mutable sequences in
-        # https://docs.python.org/3/library/stdtypes.html#mutable-sequence-types
-        # and CPython's bytearray tracks an internal offset (``ob_start`` in
-        # Objects/bytearrayobject.c) that makes repeated deletes from the
-        # front amortized O(1) per byte rather than O(len) per frame.
-        del self._data[:9+length]
-
-        # Pass the frame through the header buffer.
-        new_frame = self._update_header_buffer(f)
-
-        # If we got a frame we didn't understand or shouldn't yield, rather
-        # than return None it'd be better if we just tried to get the next
-        # frame in the sequence instead. Recurse back into ourselves to do
-        # that. This is safe because the amount of work we have to do here is
-        # strictly bounded by the length of the buffer.
-        return new_frame if new_frame is not None else self.__next__()
+        return frame

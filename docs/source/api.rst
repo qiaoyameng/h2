@@ -27,6 +27,13 @@ Configuration
    :members:
 
 
+Receive Results
+---------------
+
+.. autoclass:: h2.connection.ReceiveDataResult
+   :members:
+
+
 .. _h2-events-api:
 
 Events
@@ -145,6 +152,10 @@ Protocol Errors
    :members:
 
 .. autoclass:: h2.exceptions.DenialOfServiceError
+   :show-inheritance:
+   :members:
+
+.. autoclass:: h2.exceptions.InboundBufferTooLargeError
    :show-inheritance:
    :members:
 

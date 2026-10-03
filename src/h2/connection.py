@@ -7,8 +7,9 @@ An implementation of a HTTP/2 connection.
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, overload
 
 from hpack.exceptions import HPACKError, OversizedHeaderListError
 from hpack.hpack import Decoder, Encoder
@@ -51,6 +52,7 @@ from .exceptions import (
     DenialOfServiceError,
     FlowControlError,
     FrameTooLargeError,
+    InboundBufferTooLargeError,
     NoAvailableStreamIDError,
     NoSuchStreamError,
     ProtocolError,
@@ -273,6 +275,76 @@ class H2ConnectionStateMachine:
             return []
 
 
+@dataclass
+class ReceiveDataResult:
+    """
+    The result of one bounded pass over received HTTP/2 data.
+
+    :param events: Events produced during this pass.
+    :param frames_processed: Number of HTTP/2 wire frames parsed. Each
+        CONTINUATION frame counts toward this total.
+    :param has_processable_data: Whether another pass can parse at least one
+        more complete wire frame.
+    :param needs_more_data: Whether the retained data is incomplete and needs
+        more bytes before another frame can be parsed.
+    """
+
+    events: list[Event]
+    frames_processed: int
+    has_processable_data: bool
+    needs_more_data: bool
+
+    @property
+    def frames_parsed(self) -> int:
+        """Alias for :attr:`frames_processed`."""
+        return self.frames_processed
+
+    @property
+    def frames_consumed(self) -> int:
+        """Alias for :attr:`frames_processed`."""
+        return self.frames_processed
+
+    @property
+    def more_data_needed(self) -> bool:
+        """Alias for :attr:`needs_more_data`."""
+        return self.needs_more_data
+
+    @property
+    def requires_more_data(self) -> bool:
+        """Alias for :attr:`needs_more_data`."""
+        return self.needs_more_data
+
+    @property
+    def needs_more_bytes(self) -> bool:
+        """Alias for :attr:`needs_more_data`."""
+        return self.needs_more_data
+
+    @property
+    def more_bytes_needed(self) -> bool:
+        """Alias for :attr:`needs_more_data`."""
+        return self.needs_more_data
+
+    @property
+    def data_available(self) -> bool:
+        """Alias for :attr:`has_processable_data`."""
+        return self.has_processable_data
+
+    @property
+    def processable_data_available(self) -> bool:
+        """Alias for :attr:`has_processable_data`."""
+        return self.has_processable_data
+
+    @property
+    def has_more_data(self) -> bool:
+        """Alias for :attr:`has_processable_data`."""
+        return self.has_processable_data
+
+    @property
+    def more_processable_data(self) -> bool:
+        """Alias for :attr:`has_processable_data`."""
+        return self.has_processable_data
+
+
 class H2Connection:
     """
     A low-level HTTP/2 connection object. This handles building and receiving
@@ -318,6 +390,11 @@ class H2Connection:
 
     # The initial default value of SETTINGS_MAX_HEADER_LIST_SIZE.
     DEFAULT_MAX_HEADER_LIST_SIZE = 2**16
+
+    # The maximum number of retained inbound bytes for bounded receives.
+    DEFAULT_MAX_INBOUND_BUFFER_SIZE = (
+        65 * (DEFAULT_MAX_INBOUND_FRAME_SIZE + 9)
+    )
 
     # Keep in memory limited amount of results for streams closes
     MAX_CLOSED_STREAMS = 2**16
@@ -1498,20 +1575,99 @@ class H2Connection:
         for stream in self.streams.values():
             stream._inbound_flow_control_change_from_settings(delta)
 
-    def receive_data(self, data: Buffer) -> list[Event]:
+    @overload
+    def receive_data(
+        self,
+        data: Buffer,
+        *,
+        frame_budget: None = None,
+        max_inbound_buffer_size: int | None = None,
+    ) -> list[Event]: ...
+
+    @overload
+    def receive_data(
+        self,
+        data: Buffer,
+        *,
+        frame_budget: int,
+        max_inbound_buffer_size: int | None = None,
+    ) -> ReceiveDataResult: ...
+
+    def receive_data(
+        self,
+        data: Buffer,
+        *,
+        frame_budget: int | None = None,
+        max_inbound_buffer_size: int | None = None,
+    ) -> list[Event] | ReceiveDataResult:
         """
         Pass some received HTTP/2 data to the connection for handling.
 
         :param data: The data received from the remote peer on the network.
         :type data: An object implementing the buffer protocol.
-        :returns: A list of events that the remote peer triggered by sending
-            this data.
+        :param frame_budget: Maximum number of HTTP/2 wire frames to parse in
+            this pass. CONTINUATION frames are counted. When omitted, all
+            available frames are processed.
+        :type frame_budget: ``int`` or ``None``
+        :param max_inbound_buffer_size: Maximum number of inbound bytes that
+            may be retained after adding ``data``. Only applies when
+            ``frame_budget`` is provided.
+        :type max_inbound_buffer_size: ``int`` or ``None``
+        :returns: A list of events when ``frame_budget`` is omitted, or a
+            :class:`ReceiveDataResult` when a frame budget is provided.
+        """
+        if frame_budget is not None:
+            return self._receive_data_budgeted(
+                data,
+                frame_budget=frame_budget,
+                max_inbound_buffer_size=max_inbound_buffer_size,
+            )
+
+        if max_inbound_buffer_size is not None:
+            msg = "max_inbound_buffer_size requires frame_budget"
+            raise ValueError(msg)
+
+        return self._receive_data_unbounded(data)
+
+    def receive_buffered_data(
+        self,
+        frame_budget: int,
+        *,
+        max_inbound_buffer_size: int | None = None,
+    ) -> ReceiveDataResult:
+        """
+        Process data already retained by the connection within a frame
+        budget.
+
+        :param frame_budget: Maximum number of HTTP/2 wire frames to parse.
+        :type frame_budget: ``int``
+        :param max_inbound_buffer_size: Maximum number of inbound bytes that
+            may be retained while waiting for a complete frame.
+        :type max_inbound_buffer_size: ``int`` or ``None``
+        :returns: The events produced and the state of the retained input.
+        """
+        return self._receive_data_budgeted(
+            b"",
+            frame_budget=frame_budget,
+            max_inbound_buffer_size=max_inbound_buffer_size,
+        )
+
+    advance_inbound = receive_buffered_data
+    advance_receive_buffer = receive_buffered_data
+    process_received_data = receive_buffered_data
+    process_inbound_data = receive_buffered_data
+    process_buffered_data = receive_buffered_data
+
+    def _receive_data_unbounded(self, data: Buffer) -> list[Event]:
+        """
+        Preserve the historical behavior of :meth:`receive_data`.
         """
         self.config.logger.trace(
             "Process received data on connection. Received data: %r", data,
         )
 
         events: list[Event] = []
+        self.incoming_buffer.max_buffer_size = None
         self.incoming_buffer.add_data(data)
         self.incoming_buffer.max_frame_size = self.max_inbound_frame_size
 
@@ -1531,6 +1687,79 @@ class H2Connection:
             raise
 
         return events
+
+    def _receive_data_budgeted(
+        self,
+        data: Buffer,
+        frame_budget: int,
+        max_inbound_buffer_size: int | None,
+    ) -> ReceiveDataResult:
+        if not isinstance(frame_budget, int) or isinstance(frame_budget, bool):
+            msg = "frame_budget must be an integer"
+            raise TypeError(msg)
+        if frame_budget < 0:
+            msg = "frame_budget must be greater than or equal to zero"
+            raise ValueError(msg)
+        if max_inbound_buffer_size is None:
+            max_inbound_buffer_size = self.DEFAULT_MAX_INBOUND_BUFFER_SIZE
+        if not isinstance(max_inbound_buffer_size, int) or isinstance(max_inbound_buffer_size, bool):
+            msg = "max_inbound_buffer_size must be an integer"
+            raise TypeError(msg)
+        if max_inbound_buffer_size < 0:
+            msg = "max_inbound_buffer_size must be greater than or equal to zero"
+            raise ValueError(msg)
+
+        self.config.logger.trace(
+            "Process received data on connection. Received data: %r", data,
+        )
+
+        self.incoming_buffer.max_buffer_size = max_inbound_buffer_size
+        self.incoming_buffer.add_data(data)
+        self.incoming_buffer.max_frame_size = self.max_inbound_frame_size
+
+        if self.incoming_buffer.buffered_data_length > max_inbound_buffer_size:
+            msg = (
+                f"Inbound buffer contains {self.incoming_buffer.buffered_data_length} "
+                f"bytes, exceeding the limit of {max_inbound_buffer_size}"
+            )
+            raise InboundBufferTooLargeError(msg)
+
+        events: list[Event] = []
+        frames_processed = 0
+
+        try:
+            while frames_processed < frame_budget:
+                frame, parsed = self.incoming_buffer.parse_frames(
+                    frame_budget - frames_processed,
+                )
+                frames_processed += parsed
+                if frame is None:
+                    break
+                events.extend(self._receive_frame(frame))
+                if frames_processed >= frame_budget:
+                    break
+        except InvalidPaddingError as e:
+            self._terminate_connection(ErrorCodes.PROTOCOL_ERROR)
+            msg = "Received frame with invalid padding."
+            raise ProtocolError(msg) from e
+        except ProtocolError as e:
+            if isinstance(e, InboundBufferTooLargeError):
+                raise
+            self._terminate_connection(e.error_code)
+            raise
+
+        has_processable_data = self.incoming_buffer.has_complete_frame
+
+        return ReceiveDataResult(
+            events=events,
+            frames_processed=frames_processed,
+            has_processable_data=has_processable_data,
+            needs_more_data=not has_processable_data and bool(
+                self.incoming_buffer.buffered_data_length
+                or self.incoming_buffer.in_header_block
+                or self.incoming_buffer.waiting_for_preamble
+            ),
+        )
 
     def _receive_frame(self, frame: Frame) -> list[Event]:
         """

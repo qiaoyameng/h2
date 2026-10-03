@@ -1,6 +1,19 @@
 Release History
 ===============
 
+Unreleased
+----------
+
+**API Changes (Backward Compatible)**
+
+- ``H2Connection.receive_data`` now accepts ``frame_budget`` for bounded
+  inbound processing. Incomplete frames, connection preambles, and header
+  blocks are retained across calls; ``ReceiveDataResult`` reports whether more
+  data is processable or more network bytes are required.
+- Bounded inbound processing rejects input that exceeds the configured inbound
+  buffer limit with ``InboundBufferTooLargeError``. Calls without
+  ``frame_budget`` retain the previous unbounded, backward-compatible behavior.
+
 4.4.1 (2026-08-03)
 ------------------
 

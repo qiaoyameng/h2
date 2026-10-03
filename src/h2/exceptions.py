@@ -192,3 +192,10 @@ class DenialOfServiceError(ProtocolError):
     #: The error code corresponds to this kind of
     #: :class:`ProtocolError <h2.exceptions.ProtocolError>`
     error_code = ErrorCodes.ENHANCE_YOUR_CALM
+
+
+class InboundBufferTooLargeError(DenialOfServiceError):
+    """
+    The remote peer sent more data than the inbound buffer is configured to
+    retain.
+    """
