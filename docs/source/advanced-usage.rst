@@ -323,3 +323,49 @@ a certain number of bytes have been freed up.
 
 For most applications, this method should be preferred to the manual flow
 control mechanism.
+
+Custom Window Update Policies
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 4.5.0
+
+The exact timing with which the automatic strategy emits
+``WINDOW_UPDATE`` frames is configurable. This is useful for applications
+that want to base that decision on their own notion of backpressure, for
+example a memory watermark rather than h2's fixed thresholds.
+
+Provide a *factory* (a zero-argument callable) to the
+:paramref:`window_update_policy <h2.config.H2Configuration.window_update_policy>`
+argument of :class:`H2Configuration <h2.config.H2Configuration>`. h2 calls
+the factory once for the connection level window and once for each stream,
+so any state held by the returned objects is isolated between connections
+and between streams. The object returned must implement the
+:class:`h2.windows.WindowUpdatePolicy` protocol::
+
+    class MemoryWatermarkPolicy:
+        def window_increment(self, consumed_size, state):
+            # Hand back nothing while memory pressure is high, then return
+            # every released byte once the watermark has been reached.
+            if buffer_under_watermark():
+                return state.bytes_processed
+            return None
+
+    config = h2.config.H2Configuration(
+        window_update_policy=MemoryWatermarkPolicy,
+    )
+
+``consumed_size`` is the number of bytes the application just released via
+:meth:`acknowledge_received_data
+<h2.connection.H2Connection.acknowledge_received_data>`, and ``state`` is a
+:class:`h2.windows.WindowState` snapshot: the number of bytes currently
+"banked" since the last update (``bytes_processed``), the current and
+maximum window sizes, and the stream ID (``0`` for the connection).
+
+Return ``None`` to keep the banked bytes and be consulted again on the next
+acknowledgement, or return an integer to replenish the window by that amount.
+The integer must not be negative, must not exceed ``state.bytes_processed``
+(you cannot hand back space the application has not released), and must not
+grow the window beyond ``2**31 - 1``. Illegal suggestions raise
+:class:`h2.exceptions.InvalidWindowUpdateError`. The default,
+:class:`h2.windows.DefaultWindowUpdatePolicy`, preserves the historical
+behaviour exactly.

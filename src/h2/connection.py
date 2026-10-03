@@ -399,6 +399,8 @@ class H2Connection:
         # The flow control window manager for the connection.
         self._inbound_flow_control_window_manager = WindowManager(
             max_window_size=self.local_settings.initial_window_size,
+            window_update_policy=self.config.window_update_policy,
+            stream_id=0,
         )
 
         # When in doubt use dict-dispatch.
@@ -501,6 +503,7 @@ class H2Connection:
             config=self.config,
             inbound_window_size=self.local_settings.initial_window_size,
             outbound_window_size=self.remote_settings.initial_window_size,
+            inbound_window_policy=self.config.window_update_policy,
         )
         self.config.logger.debug("Stream ID %d created", stream_id)
         s.max_outbound_frame_size = self.max_outbound_frame_size

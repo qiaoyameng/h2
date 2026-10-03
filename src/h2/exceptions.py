@@ -61,6 +61,20 @@ class FlowControlError(ProtocolError):
     error_code = ErrorCodes.FLOW_CONTROL_ERROR
 
 
+class InvalidWindowUpdateError(FlowControlError):
+    """
+    A configured window update policy returned an increment that cannot be
+    applied.
+
+    This is raised when a policy suggests a negative increment, suggests more
+    bytes than the application has actually released back to h2, or suggests
+    an increment that would grow the flow control window beyond its legal
+    maximum of ``2**31 - 1`` bytes.
+
+    .. versionadded:: 4.5.0
+    """
+
+
 class StreamIDTooLowError(ProtocolError):
     """
     An attempt was made to open a stream that had an ID that is lower than the

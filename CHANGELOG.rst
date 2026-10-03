@@ -1,6 +1,23 @@
 Release History
 ===============
 
+4.5.0 (unreleased)
+------------------
+
+**API Changes (Backward Compatible)**
+
+- Added the ``window_update_policy`` argument to
+  ``h2.config.H2Configuration``. It accepts a zero-argument callable that
+  builds a policy object implementing ``window_increment(consumed_size,
+  state)``, allowing applications to decide when inbound connection and
+  stream flow control windows are replenished (for example from a memory
+  watermark) instead of using h2's fixed thresholds. Policy state is
+  isolated per connection and per stream, the default policy preserves the
+  historical WINDOW_UPDATE timing exactly, and illegal suggestions (negative
+  increments, increments larger than the released quota, or increments that
+  would overflow the 2**31 - 1 window maximum) raise
+  ``h2.exceptions.InvalidWindowUpdateError``.
+
 4.4.1 (2026-08-03)
 ------------------
 

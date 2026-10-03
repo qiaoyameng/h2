@@ -7,7 +7,10 @@ Objects for controlling the configuration of the HTTP/2 stack.
 from __future__ import annotations
 
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .windows import WindowUpdatePolicy
 
 
 class _BooleanConfigOption:
@@ -149,6 +152,19 @@ class H2Configuration:
         .. versionadded:: 2.6.0
 
     :type logger: ``logging.Logger``
+
+    :param window_update_policy: A zero-argument callable used to construct
+        the policy that decides when inbound flow control windows are
+        replenished. It is invoked once for the connection level window and
+        once per stream, so state held by the returned objects is isolated
+        between connections and between streams. The object returned must
+        provide a ``window_increment(consumed_size, state)`` method. Defaults
+        to :class:`h2.windows.DefaultWindowUpdatePolicy`, which preserves
+        the historical WINDOW_UPDATE timing.
+
+        .. versionadded:: 4.5.0
+
+    :type window_update_policy: callable or ``None``
     """
 
     client_side = _BooleanConfigOption("client_side")
@@ -176,7 +192,8 @@ class H2Configuration:
                  split_outbound_cookies: bool = False,
                  validate_inbound_headers: bool = True,
                  normalize_inbound_headers: bool = True,
-                 logger: DummyLogger | OutputLogger | None = None) -> None:
+                 logger: DummyLogger | OutputLogger | None = None,
+                 window_update_policy: Callable[[], "WindowUpdatePolicy"] | None = None) -> None:
         self.client_side = client_side
         self.header_encoding = header_encoding
         self.validate_outbound_headers = validate_outbound_headers
@@ -185,6 +202,7 @@ class H2Configuration:
         self.validate_inbound_headers = validate_inbound_headers
         self.normalize_inbound_headers = normalize_inbound_headers
         self.logger = logger or DummyLogger(__name__)
+        self.window_update_policy = window_update_policy
 
     @property
     def header_encoding(self) -> bool | str | None:
@@ -210,3 +228,18 @@ class H2Configuration:
             msg = "header_encoding cannot be True"
             raise ValueError(msg)
         self._header_encoding = value
+
+    @property
+    def window_update_policy(self) -> Callable[[], "WindowUpdatePolicy"] | None:
+        """
+        A zero-argument callable used to construct the window update policy,
+        or ``None`` to use the default policy.
+        """
+        return self._window_update_policy
+
+    @window_update_policy.setter
+    def window_update_policy(self, value: Callable[[], "WindowUpdatePolicy"] | None) -> None:
+        if value is not None and not callable(value):
+            msg = "window_update_policy must be callable or None"
+            raise ValueError(msg)
+        self._window_update_policy = value

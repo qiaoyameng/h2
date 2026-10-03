@@ -26,6 +26,12 @@ Configuration
 .. autoclass:: h2.config.H2Configuration
    :members:
 
+Window Update Policies
+----------------------
+
+.. automodule:: h2.windows
+   :members: WindowState, WindowUpdatePolicy, DefaultWindowUpdatePolicy
+
 
 .. _h2-events-api:
 
@@ -123,6 +129,10 @@ Protocol Errors
    :members:
 
 .. autoclass:: h2.exceptions.FlowControlError
+   :show-inheritance:
+   :members:
+
+.. autoclass:: h2.exceptions.InvalidWindowUpdateError
    :show-inheritance:
    :members:
 
