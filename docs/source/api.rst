@@ -27,6 +27,19 @@ Configuration
    :members:
 
 
+HPACK Codecs
+------------
+
+The HPACK implementation used by a connection can be replaced by supplying
+encoder and decoder factories to :class:`h2.config.H2Configuration`. The
+factories, the codec protocols, and the default implementations are defined
+in :mod:`h2.hpack_codecs`.
+
+.. automodule:: h2.hpack_codecs
+   :members:
+   :exclude-members: register_encoder, register_decoder
+
+
 .. _h2-events-api:
 
 Events

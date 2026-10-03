@@ -1,6 +1,29 @@
 Release History
 ===============
 
+dev
+---
+
+**New Features**
+
+- ``H2Configuration`` now accepts ``header_encoder_factory`` and
+  ``header_decoder_factory`` callables, providing a formal extension point for
+  plugging in alternative HPACK implementations. Each factory is called once
+  per connection with the limits in force for its direction (remote
+  ``SETTINGS_HEADER_TABLE_SIZE`` for encoders; local
+  ``SETTINGS_MAX_HEADER_LIST_SIZE`` and ``SETTINGS_HEADER_TABLE_SIZE`` for
+  decoders) and must return a fresh codec object. The minimal
+  ``HeaderEncoder``/``HeaderDecoder`` protocols live in the new
+  :mod:`h2.hpack_codecs` module, along with the default factories wrapping
+  the bundled :mod:`hpack` library.
+- Codecs returned for two live connections are rejected with ``ValueError``
+  unless they explicitly set ``h2_allows_shared_state = True``, preventing
+  accidental sharing of per-connection dynamic-table state.
+- Errors raised by a pluggable encoder or decoder are now mapped to h2's
+  public exceptions (``ProtocolError`` / ``DenialOfServiceError``) instead of
+  leaking the codec's own exception types. A header block that fails to
+  decode never exposes partially decoded headers as events.
+
 4.4.1 (2026-08-03)
 ------------------
 

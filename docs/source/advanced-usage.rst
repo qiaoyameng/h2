@@ -323,3 +323,49 @@ a certain number of bytes have been freed up.
 
 For most applications, this method should be preferred to the manual flow
 control mechanism.
+
+
+.. _advanced-custom-hpack:
+
+Custom HPACK Implementations
+----------------------------
+
+h2 ships with the excellent :mod:`hpack` library, but you may want to compare
+or substitute a different HPACK implementation (for example, a native
+accelerated one). This is supported through two factory callables on
+:class:`h2.config.H2Configuration`:
+
+.. code-block:: python
+
+    import h2.config
+    import h2.connection
+
+    config = h2.config.H2Configuration(
+        client_side=True,
+        header_encoder_factory=my_encoder_factory,
+        header_decoder_factory=my_decoder_factory,
+    )
+    connection = h2.connection.H2Connection(config=config)
+
+The encoder factory is called once per connection with the current remote
+``SETTINGS_HEADER_TABLE_SIZE`` (an ``int``). The decoder factory is called
+once per connection with the local ``SETTINGS_MAX_HEADER_LIST_SIZE`` (an
+``int`` or ``None``) and the local ``SETTINGS_HEADER_TABLE_SIZE`` (an
+``int``). Both must return a *fresh* object implementing the
+:class:`~h2.hpack_codecs.HeaderEncoder` and
+:class:`~h2.hpack_codecs.HeaderDecoder` protocols respectively. h2 keeps the
+relevant limits synchronised when SETTINGS are acknowledged, so a codec does
+not need to parse SETTINGS frames itself.
+
+Returning the same codec object for two live connections is rejected with
+``ValueError``: HPACK dynamic tables are per-connection state and silently
+sharing one corrupts both connections. If your codec is deliberately
+stateless or otherwise safe to share, set
+``h2_allows_shared_state = True`` on the returned object to acknowledge the
+contract explicitly.
+
+Any exception raised by a custom codec is translated to a public h2
+exception: oversized header lists become
+:class:`h2.exceptions.DenialOfServiceError`, and all other failures become
+:class:`h2.exceptions.ProtocolError`. A header block that fails partway
+through decoding never yields partially decoded headers as events.

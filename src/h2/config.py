@@ -7,7 +7,10 @@ Objects for controlling the configuration of the HTTP/2 stack.
 from __future__ import annotations
 
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .hpack_codecs import DecoderFactory, EncoderFactory
 
 
 class _BooleanConfigOption:
@@ -142,6 +145,32 @@ class H2Configuration:
 
     :type normalize_inbound_headers: ``bool``
 
+    :param header_encoder_factory: A callable used to construct the HPACK
+        encoder for each connection. It is called once per connection with the
+        current remote ``SETTINGS_HEADER_TABLE_SIZE`` (an ``int``) and must
+        return a fresh object implementing the
+        :class:`~h2.hpack_codecs.HeaderEncoder` protocol. Defaults to a factory
+        wrapping the bundled :mod:`hpack` encoder. See
+        :mod:`h2.hpack_codecs` for the full contract.
+
+        .. versionadded:: 4.5.0
+
+    :type header_encoder_factory: ``Callable[[int], HeaderEncoder]``
+
+    :param header_decoder_factory: A callable used to construct the HPACK
+        decoder for each connection. It is called once per connection with the
+        current local ``SETTINGS_MAX_HEADER_LIST_SIZE`` (``int`` or ``None``)
+        and the local ``SETTINGS_HEADER_TABLE_SIZE`` (an ``int``) and must
+        return a fresh object implementing the
+        :class:`~h2.hpack_codecs.HeaderDecoder` protocol. Defaults to a factory
+        wrapping the bundled :mod:`hpack` decoder. See
+        :mod:`h2.hpack_codecs` for the full contract.
+
+        .. versionadded:: 4.5.0
+
+    :type header_decoder_factory:
+        ``Callable[[int | None, int], HeaderDecoder]``
+
     :param logger: A logger that conforms to the requirements for this module,
         those being no I/O and no context switches, which is needed in order
         to run in asynchronous operation.
@@ -176,6 +205,8 @@ class H2Configuration:
                  split_outbound_cookies: bool = False,
                  validate_inbound_headers: bool = True,
                  normalize_inbound_headers: bool = True,
+                 header_encoder_factory: EncoderFactory | None = None,
+                 header_decoder_factory: DecoderFactory | None = None,
                  logger: DummyLogger | OutputLogger | None = None) -> None:
         self.client_side = client_side
         self.header_encoding = header_encoding
@@ -184,6 +215,8 @@ class H2Configuration:
         self.split_outbound_cookies = split_outbound_cookies
         self.validate_inbound_headers = validate_inbound_headers
         self.normalize_inbound_headers = normalize_inbound_headers
+        self.header_encoder_factory = header_encoder_factory
+        self.header_decoder_factory = header_decoder_factory
         self.logger = logger or DummyLogger(__name__)
 
     @property
@@ -210,3 +243,50 @@ class H2Configuration:
             msg = "header_encoding cannot be True"
             raise ValueError(msg)
         self._header_encoding = value
+
+    @property
+    def header_encoder_factory(self) -> EncoderFactory:
+        """
+        The callable used to build the HPACK encoder of each connection.
+
+        It is invoked once per connection with the current remote
+        ``SETTINGS_HEADER_TABLE_SIZE`` and must return a fresh encoder. If no
+        factory was supplied, the default factory wrapping the bundled
+        :mod:`hpack` library is returned.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._header_encoder_factory
+
+    @header_encoder_factory.setter
+    def header_encoder_factory(self, value: EncoderFactory | None) -> None:
+        from .hpack_codecs import default_encoder_factory
+
+        if value is not None and not callable(value):
+            msg = "header_encoder_factory must be callable or None"
+            raise ValueError(msg)
+        self._header_encoder_factory = value or default_encoder_factory
+
+    @property
+    def header_decoder_factory(self) -> DecoderFactory:
+        """
+        The callable used to build the HPACK decoder of each connection.
+
+        It is invoked once per connection with the local
+        ``SETTINGS_MAX_HEADER_LIST_SIZE`` (``int`` or ``None``) and the local
+        ``SETTINGS_HEADER_TABLE_SIZE`` and must return a fresh decoder. If no
+        factory was supplied, the default factory wrapping the bundled
+        :mod:`hpack` library is returned.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._header_decoder_factory
+
+    @header_decoder_factory.setter
+    def header_decoder_factory(self, value: DecoderFactory | None) -> None:
+        from .hpack_codecs import default_decoder_factory
+
+        if value is not None and not callable(value):
+            msg = "header_decoder_factory must be callable or None"
+            raise ValueError(msg)
+        self._header_decoder_factory = value or default_decoder_factory
