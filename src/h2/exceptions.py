@@ -160,6 +160,34 @@ class UnsupportedFrameError(ProtocolError):
        Removed deprecated KeyError parent class.
     """
 
+class ExtensionError(H2Error):
+    """
+    Base class for errors raised by registered extension frame handlers.
+    """
+
+
+class ExtensionProtocolError(ExtensionError):
+    """
+    A registered extension frame handler rejected a frame as a protocol error.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        error_code: ErrorCodes | int | None = ErrorCodes.PROTOCOL_ERROR,
+        *,
+        stream_error: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.stream_error = stream_error
+        self.stream_id: int | None = None
+
+
+class ExtensionApplicationError(ExtensionError):
+    """
+    A registered extension frame handler encountered an application error.
+    """
 
 
 class RFC1122Error(H2Error):

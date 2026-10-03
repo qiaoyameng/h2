@@ -49,6 +49,8 @@ from .events import (
 )
 from .exceptions import (
     DenialOfServiceError,
+    ExtensionApplicationError,
+    ExtensionProtocolError,
     FlowControlError,
     FrameTooLargeError,
     NoAvailableStreamIDError,
@@ -60,6 +62,11 @@ from .exceptions import (
     TooManyStreamsError,
 )
 from .frame_buffer import FrameBuffer
+from .extensions import (
+    ExtensionFrameHandler,
+    ExtensionFrameScope,
+    ReceivedExtensionFrame,
+)
 from .settings import ChangedSetting, SettingCodes, Settings
 from .stream import H2Stream, StreamClosedBy
 from .utilities import SizeLimitDict, guard_increment_window
@@ -106,6 +113,23 @@ class ConnectionInputs(Enum):
 class AllowedStreamIDs(IntEnum):
     EVEN = 0
     ODD = 1
+
+
+_STANDARD_FRAME_TYPES = frozenset(range(11))
+
+
+class _RegisteredExtensionFrameHandler:
+    __slots__ = ("handler", "scope", "max_payload_size")
+
+    def __init__(
+        self,
+        handler: ExtensionFrameHandler,
+        scope: ExtensionFrameScope,
+        max_payload_size: int,
+    ) -> None:
+        self.handler = handler
+        self.scope = scope
+        self.max_payload_size = max_payload_size
 
 
 class H2ConnectionStateMachine:
@@ -158,7 +182,6 @@ class H2ConnectionStateMachine:
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.IDLE, ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
             (None, ConnectionState.CLIENT_OPEN),
-
         # State: open, client side.
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_HEADERS):
             (None, ConnectionState.CLIENT_OPEN),
@@ -197,7 +220,6 @@ class H2ConnectionStateMachine:
         (ConnectionState.CLIENT_OPEN,
             ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
                 (None, ConnectionState.CLIENT_OPEN),
-
         # State: open, server side.
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_HEADERS):
             (None, ConnectionState.SERVER_OPEN),
@@ -239,7 +261,6 @@ class H2ConnectionStateMachine:
         (ConnectionState.SERVER_OPEN,
             ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
                 (None, ConnectionState.SERVER_OPEN),
-
         # State: closed
         (ConnectionState.CLOSED, ConnectionInputs.SEND_GOAWAY):
             (None, ConnectionState.CLOSED),
@@ -396,6 +417,11 @@ class H2Connection:
             size_limit=self.MAX_CLOSED_STREAMS,
         )
 
+        self._extension_frame_handlers: dict[
+            int,
+            _RegisteredExtensionFrameHandler,
+        ] = {}
+
         # The flow control window manager for the connection.
         self._inbound_flow_control_window_manager = WindowManager(
             max_window_size=self.local_settings.initial_window_size,
@@ -416,6 +442,140 @@ class H2Connection:
             AltSvcFrame: self._receive_alt_svc_frame,
             ExtensionFrame: self._receive_unknown_frame,
         }
+
+    @staticmethod
+    def _validate_frame_type(frame_type: int) -> None:
+        if not isinstance(frame_type, int) or isinstance(frame_type, bool):
+            msg = "Frame type must be an integer"
+            raise TypeError(msg)
+        if not 0 <= frame_type <= 255:
+            msg = "Frame type must be between 0 and 255"
+            raise ValueError(msg)
+        if frame_type in _STANDARD_FRAME_TYPES:
+            msg = f"Frame type {frame_type} is reserved by the HTTP/2 core"
+            raise ValueError(msg)
+
+    def register_extension_frame_handler(
+        self,
+        handler: ExtensionFrameHandler,
+    ) -> None:
+        """
+        Register an extension frame handler for this connection only.
+        """
+        if not isinstance(handler, ExtensionFrameHandler):
+            msg = "Handler must be an ExtensionFrameHandler instance"
+            raise TypeError(msg)
+
+        frame_type = handler.frame_type
+        self._validate_frame_type(frame_type)
+
+        scope = handler.scope
+        if scope not in ExtensionFrameScope:
+            msg = "Handler scope must be an ExtensionFrameScope value"
+            raise ValueError(msg)
+
+        max_payload_size = handler.max_payload_size
+        if (
+            not isinstance(max_payload_size, int)
+            or isinstance(max_payload_size, bool)
+            or max_payload_size < 0
+        ):
+            msg = "Maximum payload size must be a non-negative integer"
+            raise ValueError(msg)
+
+        if frame_type in self._extension_frame_handlers:
+            msg = f"A handler is already registered for frame type {frame_type}"
+            raise ValueError(msg)
+
+        self._extension_frame_handlers[frame_type] = (
+            _RegisteredExtensionFrameHandler(
+                handler,
+                scope,
+                max_payload_size,
+            )
+        )
+
+    def unregister_extension_frame_handler(self, frame_type: int) -> None:
+        """
+        Remove an extension frame handler from this connection.
+        """
+        self._validate_frame_type(frame_type)
+        try:
+            del self._extension_frame_handlers[frame_type]
+        except KeyError:
+            msg = f"No handler is registered for frame type {frame_type}"
+            raise KeyError(msg) from None
+
+    def send_extension_frame(
+        self,
+        frame_type: int,
+        payload: bytes = b"",
+        stream_id: int = 0,
+        flags: int = 0,
+    ) -> None:
+        """
+        Send a privately negotiated HTTP/2 extension frame.
+        """
+        self._validate_frame_type(frame_type)
+        if not isinstance(payload, bytes):
+            msg = "Extension frame payload must be bytes"
+            raise TypeError(msg)
+        if not isinstance(stream_id, int) or isinstance(stream_id, bool):
+            msg = "Stream ID must be an integer"
+            raise TypeError(msg)
+        if not 0 <= stream_id <= self.HIGHEST_ALLOWED_STREAM_ID:
+            msg = "Stream ID is outside the valid range"
+            raise ValueError(msg)
+        if not isinstance(flags, int) or isinstance(flags, bool):
+            msg = "Frame flags must be an integer"
+            raise TypeError(msg)
+        if not 0 <= flags <= 255:
+            msg = "Frame flags must be between 0 and 255"
+            raise ValueError(msg)
+        if self.state_machine.state is ConnectionState.CLOSED:
+            msg = "Cannot send an extension frame on a closed connection"
+            raise ProtocolError(msg)
+
+        registered_handler = self._extension_frame_handlers.get(frame_type)
+        max_payload_size = (
+            registered_handler.max_payload_size
+            if registered_handler is not None
+            else self.max_outbound_frame_size
+        )
+        if len(payload) > max_payload_size:
+            msg = (
+                f"Extension frame payload is {len(payload)} bytes; "
+                f"maximum is {max_payload_size}"
+            )
+            raise FrameTooLargeError(msg)
+        if len(payload) > self.max_outbound_frame_size:
+            msg = (
+                f"Extension frame payload is {len(payload)} bytes; "
+                f"maximum outbound frame size is {self.max_outbound_frame_size}"
+            )
+            raise FrameTooLargeError(msg)
+
+        if registered_handler is not None:
+            if (
+                registered_handler.scope is ExtensionFrameScope.CONNECTION
+                and stream_id != 0
+            ):
+                msg = "Connection-scoped extension frame must use stream ID 0"
+                raise ProtocolError(msg)
+            if registered_handler.scope is ExtensionFrameScope.STREAM:
+                if stream_id == 0:
+                    msg = "Stream-scoped extension frame requires a stream ID"
+                    raise ProtocolError(msg)
+                self._get_stream_by_id(stream_id)
+
+        frame = ExtensionFrame(
+            type=frame_type,
+            stream_id=stream_id,
+            flag_byte=flags,
+            body=payload,
+        )
+        frame.body_len = len(payload)
+        self._prepare_for_sending([frame])
 
     def _prepare_for_sending(self, frames: list[Frame]) -> None:
         if not frames:
@@ -1518,6 +1678,9 @@ class H2Connection:
         try:
             for frame in self.incoming_buffer:
                 events.extend(self._receive_frame(frame))
+        except ExtensionProtocolError as e:
+            self._handle_extension_protocol_error(e)
+            raise
         except InvalidPaddingError as e:
             self._terminate_connection(ErrorCodes.PROTOCOL_ERROR)
             msg = "Received frame with invalid padding."
@@ -1531,6 +1694,36 @@ class H2Connection:
             raise
 
         return events
+
+    def _handle_extension_protocol_error(
+        self,
+        error: ExtensionProtocolError,
+    ) -> None:
+        error_code_value = error.error_code
+        if (
+            not isinstance(error_code_value, int)
+            or isinstance(error_code_value, bool)
+            or not 0 <= error_code_value <= 2**32 - 1
+        ):
+            error_code_value = ErrorCodes.PROTOCOL_ERROR
+        error_code = _error_code_from_int(int(error_code_value))
+
+        if not error.stream_error:
+            self._terminate_connection(error_code)
+            return
+
+        stream_id = error.stream_id
+        if (
+            not isinstance(stream_id, int)
+            or isinstance(stream_id, bool)
+            or not 1 <= stream_id <= self.HIGHEST_ALLOWED_STREAM_ID
+        ):
+            msg = "Stream protocol error does not identify a valid stream"
+            raise ExtensionApplicationError(msg) from error
+
+        frame = RstStreamFrame(stream_id)
+        frame.error_code = error_code
+        self._prepare_for_sending([frame])
 
     def _receive_frame(self, frame: Frame) -> list[Event]:
         """
@@ -1976,12 +2169,76 @@ class H2Connection:
         RFC 7540 § 5.5 says that we MUST ignore unknown frame types: so we
         do. We do notify the user that we received one, however.
         """
+        handler = self._extension_frame_handlers.get(frame.type)
+        if handler is not None:
+            return self._receive_registered_extension_frame(frame, handler)
+
         # All we do here is log.
         self.config.logger.debug(
             "Received unknown extension frame (ID %d)", frame.stream_id,
         )
         event = UnknownFrameReceived(frame=frame)
         return [], [event]
+
+    def _receive_registered_extension_frame(
+        self,
+        frame: ExtensionFrame,
+        registered_handler: _RegisteredExtensionFrameHandler,
+    ) -> tuple[list[Frame], list[Event]]:
+        """
+        Validate and deliver a registered extension frame to its handler.
+        """
+        if self.state_machine.state is ConnectionState.CLOSED:
+            msg = "Cannot receive an extension frame on a closed connection"
+            raise ProtocolError(msg)
+
+        handler = registered_handler.handler
+        payload = frame.body
+
+        if len(payload) > registered_handler.max_payload_size:
+            msg = (
+                f"Extension frame payload is {len(payload)} bytes; "
+                f"maximum is {registered_handler.max_payload_size}"
+            )
+            raise FrameTooLargeError(msg)
+
+        if (
+            registered_handler.scope is ExtensionFrameScope.CONNECTION
+            and frame.stream_id
+        ):
+            msg = "Connection-scoped extension frame must use stream ID 0"
+            raise ProtocolError(msg)
+        if registered_handler.scope is ExtensionFrameScope.STREAM:
+            if frame.stream_id == 0:
+                msg = "Stream-scoped extension frame requires a stream ID"
+                raise ProtocolError(msg)
+            self._get_stream_by_id(frame.stream_id)
+
+        delivered_frame = ReceivedExtensionFrame(
+            frame_type=frame.type,
+            stream_id=frame.stream_id,
+            flags=frame.flag_byte,
+            payload=payload,
+        )
+        try:
+            events = handler.receive_frame(delivered_frame)
+        except ExtensionProtocolError as error:
+            if error.stream_error:
+                error.stream_id = frame.stream_id
+            raise
+        except ExtensionApplicationError:
+            raise
+        except Exception as e:
+            msg = f"Extension frame handler failed: {e}"
+            raise ExtensionApplicationError(msg) from e
+
+        if not isinstance(events, list) or not all(
+            isinstance(event, Event) for event in events
+        ):
+            msg = "Extension frame handler must return a list of h2 events"
+            raise ExtensionApplicationError(msg)
+
+        return [], events
 
     def _local_settings_acked(self) -> dict[SettingCodes | int, ChangedSetting]:
         """

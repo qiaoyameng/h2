@@ -84,6 +84,23 @@ Events
    :members:
 
 
+Extension Frames
+----------------
+
+Extension handlers are registered on an individual connection. Standard frame
+types cannot be registered, and handlers declare whether their frames belong to
+stream zero or an existing stream, along with their maximum payload size.
+
+.. autoclass:: h2.extensions.ExtensionFrameScope
+   :members:
+
+.. autoclass:: h2.extensions.ReceivedExtensionFrame
+   :members:
+
+.. autoclass:: h2.extensions.ExtensionFrameHandler
+   :members:
+
+
 Exceptions
 ----------
 
@@ -100,6 +117,19 @@ Exceptions
 
 .. autoclass:: h2.exceptions.RFC1122Error
    :show-inheritance:
+   :members:
+
+
+Extension Errors
+~~~~~~~~~~~~~~~~
+
+.. autoclass:: h2.exceptions.ExtensionError
+   :members:
+
+.. autoclass:: h2.exceptions.ExtensionProtocolError
+   :members:
+
+.. autoclass:: h2.exceptions.ExtensionApplicationError
    :members:
 
 
