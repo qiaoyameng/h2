@@ -129,6 +129,36 @@ class TestH2Config:
         config.logger = logger
         assert config.logger is logger
 
+    def test_window_update_policy_factory_is_reflected(self) -> None:
+        class WindowPolicy:
+            def __call__(self, context: object) -> None:
+                return None
+
+        config = h2.config.H2Configuration(
+            inbound_window_update_policy=WindowPolicy,
+        )
+        first_policy = config.create_inbound_window_update_policy()
+        second_policy = config.create_inbound_window_update_policy()
+
+        assert isinstance(first_policy, WindowPolicy)
+        assert first_policy is not second_policy
+
+    def test_window_update_policy_object_is_supported(self) -> None:
+        class WindowPolicy:
+            def __call__(self, context: object) -> None:
+                return None
+
+        policy = WindowPolicy()
+        config = h2.config.H2Configuration(
+            inbound_window_update_policy=policy,
+        )
+
+        assert config.create_inbound_window_update_policy() is policy
+
+    def test_window_update_policy_rejects_non_callable(self) -> None:
+        with pytest.raises(TypeError):
+            h2.config.H2Configuration(inbound_window_update_policy="policy")
+
     @pytest.mark.parametrize("trace_level", [False, True])
     def test_output_logger(self, capsys, trace_level) -> None:
         logger = h2.config.OutputLogger(trace_level=trace_level)

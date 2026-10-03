@@ -13,10 +13,83 @@ does not emit too many WINDOW_UPDATE frames.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
+
 from .exceptions import FlowControlError
 
 # The largest acceptable value for a HTTP/2 flow control window.
 LARGEST_FLOW_CONTROL_WINDOW = 2**31 - 1
+
+
+@dataclass(frozen=True, slots=True)
+class WindowUpdateContext:
+    """
+    Information supplied to a window update policy.
+
+    :param stream_id: The stream ID, or ``0`` for the connection window.
+    :param consumed_bytes: Flow-controlled bytes consumed but not yet returned
+        to the peer.
+    :param current_window_size: The current size of the receive window.
+    :param max_window_size: The largest window size currently configured for
+        this manager.
+    :param available_window_size: The number of bytes that can be added before
+        reaching ``max_window_size``.
+    :param source_stream_id: For connection policies, the stream whose data was
+        consumed, when it is known.
+    """
+
+    stream_id: int
+    consumed_bytes: int
+    current_window_size: int
+    max_window_size: int
+    available_window_size: int
+    source_stream_id: int | None = None
+
+
+@runtime_checkable
+class WindowUpdatePolicy(Protocol):
+    """
+    A callable policy for deciding when receive windows are replenished.
+    """
+
+    def __call__(self, context: WindowUpdateContext) -> int | None:
+        """
+        Return the number of bytes to add to the receive window, or ``None``
+        (or ``0``) if no ``WINDOW_UPDATE`` frame should be sent.
+        """
+        ...
+
+
+class WindowUpdatePolicyFactory(Protocol):
+    """
+    A factory used to provide isolated policy state for a connection.
+    """
+
+    def __call__(self) -> WindowUpdatePolicy:
+        """
+        Create a window update policy.
+        """
+        ...
+
+
+class DefaultWindowUpdatePolicy:
+    """
+    The automatic window update strategy historically used by h2.
+    """
+
+    def __call__(self, context: WindowUpdateContext) -> int | None:
+        if self.should_update(context):
+            return min(context.consumed_bytes, context.available_window_size)
+        return None
+
+    @staticmethod
+    def should_update(context: WindowUpdateContext) -> bool:
+        return bool(context.consumed_bytes) and (
+            ((context.current_window_size == 0) and (
+                context.consumed_bytes > min(1024, context.max_window_size // 4))) or
+            context.consumed_bytes >= context.max_window_size // 2
+        )
 
 
 class WindowManager:
@@ -27,11 +100,20 @@ class WindowManager:
     :type max_window_size: ``int``
     """
 
-    def __init__(self, max_window_size: int) -> None:
+    def __init__(
+        self,
+        max_window_size: int,
+        policy: WindowUpdatePolicy | None = None,
+        stream_id: int = 0,
+    ) -> None:
         assert max_window_size <= LARGEST_FLOW_CONTROL_WINDOW
         self.max_window_size = max_window_size
         self.current_window_size = max_window_size
         self._bytes_processed = 0
+        self._window_update_policy = (
+            policy if policy is not None else DefaultWindowUpdatePolicy()
+        )
+        self.stream_id = stream_id
 
     def window_consumed(self, size: int) -> None:
         """
@@ -72,7 +154,19 @@ class WindowManager:
 
         self.max_window_size = max(self.current_window_size, self.max_window_size)
 
-    def process_bytes(self, size: int) -> int | None:
+    def window_changed(self, delta: int) -> None:
+        """
+        Update a receive window in response to changed settings without
+        consuming bytes or emitting a frame.
+        """
+        self.max_window_size += delta
+        self.current_window_size += delta
+
+        if self.current_window_size > LARGEST_FLOW_CONTROL_WINDOW:
+            msg = f"Flow control window mustn't exceed {LARGEST_FLOW_CONTROL_WINDOW}"
+            raise FlowControlError(msg)
+
+    def process_bytes(self, size: int, source_stream_id: int | None = None) -> int | None:
         """
         The application has informed us that it has processed a certain number
         of bytes. This may cause us to want to emit a window update frame. If
@@ -82,52 +176,50 @@ class WindowManager:
         :param size: The number of flow controlled bytes that the application
             has processed.
         :type size: ``int``
+        :param source_stream_id: For a connection manager, the stream for
+            which the application consumed the bytes.
+        :type source_stream_id: ``int`` or ``None``
         :returns: The number of bytes to increment the flow control window by,
             or ``None``.
         :rtype: ``int`` or ``None``
         """
-        self._bytes_processed += size
-        return self._maybe_update_window()
+        if not isinstance(size, int) or isinstance(size, bool):
+            msg = "Processed byte count must be an integer"
+            raise TypeError(msg)
+        if size < 0:
+            msg = "Cannot process a negative number of bytes"
+            raise ValueError(msg)
 
-    def _maybe_update_window(self) -> int | None:
-        """
-        Run the algorithm.
+        consumed_bytes = self._bytes_processed + size
+        available_window_size = self.max_window_size - self.current_window_size
+        context = WindowUpdateContext(
+            stream_id=self.stream_id,
+            consumed_bytes=consumed_bytes,
+            current_window_size=self.current_window_size,
+            max_window_size=self.max_window_size,
+            available_window_size=available_window_size,
+            source_stream_id=source_stream_id,
+        )
+        increment = self._window_update_policy(context)
+        if increment is None:
+            increment = 0
 
-        Our current algorithm can be described like this.
+        if not isinstance(increment, int) or isinstance(increment, bool):
+            msg = "Window update policy must return an integer or None"
+            raise TypeError(msg)
+        if increment < 0:
+            msg = "Window update policy returned a negative increment"
+            raise ValueError(msg)
+        if increment > consumed_bytes:
+            msg = "Window update increment cannot exceed consumed bytes"
+            raise ValueError(msg)
+        if increment > LARGEST_FLOW_CONTROL_WINDOW:
+            msg = "Window update increment exceeds the available receive window"
+            raise OverflowError(msg)
+        if increment > available_window_size:
+            msg = "Window update increment cannot exceed the available window"
+            raise OverflowError(msg)
 
-        1. If no bytes have been processed, we immediately return 0. There is
-           no meaningful way for us to hand space in the window back to the
-           remote peer, so let's not even try.
-        2. If there is no space in the flow control window, and we have
-           processed at least 1024 bytes (or 1/4 of the window, if the window
-           is smaller), we will emit a window update frame. This is to avoid
-           the risk of blocking a stream altogether.
-        3. If there is space in the flow control window, and we have processed
-           at least 1/2 of the window worth of bytes, we will emit a window
-           update frame. This is to minimise the number of window update frames
-           we have to emit.
-
-        In a healthy system with large flow control windows, this will
-        irregularly emit WINDOW_UPDATE frames. This prevents us starving the
-        connection by emitting eleventy bajillion WINDOW_UPDATE frames,
-        especially in situations where the remote peer is sending a lot of very
-        small DATA frames.
-        """
-        # TODO: Can the window be smaller than 1024 bytes? If not, we can
-        # streamline this algorithm.
-        if not self._bytes_processed:
-            return None
-
-        max_increment = (self.max_window_size - self.current_window_size)
-        increment = 0
-
-        # Note that, even though we may increment less than _bytes_processed,
-        # we still want to set it to zero whenever we emit an increment. This
-        # is because we'll always increment up to the maximum we can.
-        if ((self.current_window_size == 0) and (
-                self._bytes_processed > min(1024, self.max_window_size // 4))) or self._bytes_processed >= (self.max_window_size // 2):
-            increment = min(self._bytes_processed, max_increment)
-            self._bytes_processed = 0
-
+        self._bytes_processed = consumed_bytes - increment
         self.current_window_size += increment
-        return increment
+        return increment or None

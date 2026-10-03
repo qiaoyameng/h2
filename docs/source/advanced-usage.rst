@@ -323,3 +323,55 @@ a certain number of bytes have been freed up.
 
 For most applications, this method should be preferred to the manual flow
 control mechanism.
+
+Customizing Automatic Flow Control
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Applications can choose when ``acknowledge_received_data`` emits
+``WINDOW_UPDATE`` frames by passing a window update policy to
+:class:`H2Configuration <h2.config.H2Configuration>`. The policy receives a
+:class:`WindowUpdateContext <h2.windows.WindowUpdateContext>` for both the
+connection window (``stream_id == 0``) and each stream window. Returning an
+integer replenishes that window by that many bytes; returning ``None`` or ``0``
+defers the update and retains the consumed bytes for a later call.
+
+The return value must not be negative, must not be larger than the consumed
+bytes that have not already been returned, and must not exceed
+``2**31 - 1`` or the space available in the corresponding window. h2 checks
+these constraints before changing any window state.
+
+Pass a class (or another zero-argument callable returning a policy) so that
+each connection gets isolated mutable state. Stream IDs in the context allow a
+single connection-level policy instance to keep separate per-stream state::
+
+    import h2.config
+    import h2.windows
+
+
+    class MemoryWatermarkPolicy:
+        def __init__(self):
+            self.processed = {}
+            self.returned = {}
+
+        def __call__(self, context):
+            processed = self.processed.get(context.stream_id, 0)
+            returned = self.returned.get(context.stream_id, 0)
+            processed += context.consumed_bytes
+            self.processed[context.stream_id] = processed
+
+            if processed - returned < 8192:
+                return None
+
+            increment = processed - returned
+            self.returned[context.stream_id] = returned + increment
+            return increment
+
+
+    config = h2.config.H2Configuration(
+        client_side=False,
+        inbound_window_update_policy=MemoryWatermarkPolicy,
+    )
+
+The default policy is
+:class:`DefaultWindowUpdatePolicy <h2.windows.DefaultWindowUpdatePolicy>`,
+which preserves h2's historical automatic ``WINDOW_UPDATE`` timing.

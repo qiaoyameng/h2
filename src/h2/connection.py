@@ -338,6 +338,9 @@ class H2Connection:
         #:
         #: .. versionadded:: 2.5.0
         self.config = config or H2Configuration(client_side=True)
+        self._inbound_window_update_policy = (
+            self.config.create_inbound_window_update_policy()
+        )
 
         # Objects that store settings, including defaults.
         #
@@ -399,6 +402,7 @@ class H2Connection:
         # The flow control window manager for the connection.
         self._inbound_flow_control_window_manager = WindowManager(
             max_window_size=self.local_settings.initial_window_size,
+            policy=self._inbound_window_update_policy,
         )
 
         # When in doubt use dict-dispatch.
@@ -501,6 +505,7 @@ class H2Connection:
             config=self.config,
             inbound_window_size=self.local_settings.initial_window_size,
             outbound_window_size=self.remote_settings.initial_window_size,
+            inbound_window_update_policy=self._inbound_window_update_policy,
         )
         self.config.logger.debug("Stream ID %d created", stream_id)
         s.max_outbound_frame_size = self.max_outbound_frame_size
@@ -1374,7 +1379,10 @@ class H2Connection:
         frames: list[Frame] = []
 
         conn_manager = self._inbound_flow_control_window_manager
-        conn_increment = conn_manager.process_bytes(acknowledged_size)
+        conn_increment = conn_manager.process_bytes(
+            acknowledged_size,
+            source_stream_id=stream_id,
+        )
         if conn_increment:
             f = WindowUpdateFrame(0)
             f.window_increment = conn_increment
@@ -1712,6 +1720,7 @@ class H2Connection:
         conn_manager = self._inbound_flow_control_window_manager
         conn_increment = conn_manager.process_bytes(
             frame.flow_controlled_length,
+            source_stream_id=frame.stream_id,
         )
 
         if conn_increment:

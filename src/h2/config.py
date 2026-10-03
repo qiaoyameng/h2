@@ -7,7 +7,14 @@ Objects for controlling the configuration of the HTTP/2 stack.
 from __future__ import annotations
 
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from .windows import DefaultWindowUpdatePolicy
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from .windows import WindowUpdatePolicy
 
 
 class _BooleanConfigOption:
@@ -149,6 +156,13 @@ class H2Configuration:
         .. versionadded:: 2.6.0
 
     :type logger: ``logging.Logger``
+
+    :param inbound_window_update_policy: Either a policy callable or a
+        zero-argument factory that creates a policy callable. A class is the
+        preferred form of factory because each new connection receives an
+        isolated policy instance. The policy receives the consumed bytes and
+        current window information and returns the legal number of bytes to
+        replenish, or ``None``/``0`` to defer the update.
     """
 
     client_side = _BooleanConfigOption("client_side")
@@ -176,7 +190,10 @@ class H2Configuration:
                  split_outbound_cookies: bool = False,
                  validate_inbound_headers: bool = True,
                  normalize_inbound_headers: bool = True,
-                 logger: DummyLogger | OutputLogger | None = None) -> None:
+                 logger: DummyLogger | OutputLogger | None = None,
+                 inbound_window_update_policy: Callable[
+                     [], WindowUpdatePolicy
+                 ] | WindowUpdatePolicy | None = None) -> None:
         self.client_side = client_side
         self.header_encoding = header_encoding
         self.validate_outbound_headers = validate_outbound_headers
@@ -185,6 +202,37 @@ class H2Configuration:
         self.validate_inbound_headers = validate_inbound_headers
         self.normalize_inbound_headers = normalize_inbound_headers
         self.logger = logger or DummyLogger(__name__)
+        self.inbound_window_update_policy = inbound_window_update_policy
+
+    @property
+    def inbound_window_update_policy(self) -> Callable[[], WindowUpdatePolicy]:
+        """Factory returning the inbound window update policy for a connection."""
+        return self._inbound_window_update_policy
+
+    @inbound_window_update_policy.setter
+    def inbound_window_update_policy(
+        self,
+        value: Callable[[], WindowUpdatePolicy] | WindowUpdatePolicy | None,
+    ) -> None:
+        if value is not None and not callable(value):
+            msg = "inbound_window_update_policy must be callable"
+            raise TypeError(msg)
+
+        if value is None:
+            value = DefaultWindowUpdatePolicy
+
+        if isinstance(value, type):
+            self._inbound_window_update_policy = value
+        else:
+            self._inbound_window_update_policy = lambda: value  # noqa: E731
+
+    def create_inbound_window_update_policy(self) -> WindowUpdatePolicy:
+        """Create an isolated inbound window update policy for a connection."""
+        policy = self.inbound_window_update_policy()
+        if not callable(policy):
+            msg = "inbound_window_update_policy must create a callable policy"
+            raise TypeError(msg)
+        return policy
 
     @property
     def header_encoding(self) -> bool | str | None:

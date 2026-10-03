@@ -52,6 +52,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from hpack.struct import Header, HeaderWeaklyTyped
 
     from .config import H2Configuration
+    from .windows import WindowUpdatePolicy
 
 
 class StreamState(IntEnum):
@@ -774,7 +775,8 @@ class H2Stream:
                  stream_id: int,
                  config: H2Configuration,
                  inbound_window_size: int,
-                 outbound_window_size: int) -> None:
+                 outbound_window_size: int,
+                 inbound_window_update_policy: WindowUpdatePolicy | None = None) -> None:
         self.state_machine = H2StreamStateMachine(stream_id)
         self.stream_id = stream_id
         self.max_outbound_frame_size: int | None = None
@@ -784,7 +786,11 @@ class H2Stream:
         self.outbound_flow_control_window = outbound_window_size
 
         # The flow control manager.
-        self._inbound_window_manager = WindowManager(inbound_window_size)
+        self._inbound_window_manager = WindowManager(
+            inbound_window_size,
+            policy=inbound_window_update_policy,
+            stream_id=stream_id,
+        )
 
         # The expected content length, if any.
         self._expected_content_length: int | None = None
@@ -1416,9 +1422,7 @@ class H2Stream:
         current window size, but we also need to set the target maximum window
         size to the new value.
         """
-        new_max_size = self._inbound_window_manager.max_window_size + delta
-        self._inbound_window_manager.window_opened(delta)
-        self._inbound_window_manager.max_window_size = new_max_size
+        self._inbound_window_manager.window_changed(delta)
 
 
 def _decode_headers(headers: Iterable[HeaderWeaklyTyped], encoding: str) -> Generator[HeaderTuple, None, None]:

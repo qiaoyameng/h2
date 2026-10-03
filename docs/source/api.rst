@@ -26,6 +26,15 @@ Configuration
 .. autoclass:: h2.config.H2Configuration
    :members:
 
+.. autoclass:: h2.windows.WindowUpdateContext
+   :members:
+
+.. autoclass:: h2.windows.WindowUpdatePolicy
+   :members:
+
+.. autoclass:: h2.windows.DefaultWindowUpdatePolicy
+   :members:
+
 
 .. _h2-events-api:
 
