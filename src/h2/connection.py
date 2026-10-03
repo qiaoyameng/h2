@@ -78,6 +78,7 @@ class ConnectionState(Enum):
     CLIENT_OPEN = 1
     SERVER_OPEN = 2
     CLOSED = 3
+    GRACEFUL_SHUTDOWN = 4
 
 
 class ConnectionInputs(Enum):
@@ -101,6 +102,7 @@ class ConnectionInputs(Enum):
     RECV_PRIORITY = 17
     SEND_ALTERNATIVE_SERVICE = 18  # Added in 2.3.0
     RECV_ALTERNATIVE_SERVICE = 19  # Added in 2.3.0
+    INITIATE_GRACEFUL_SHUTDOWN = 20  # Added in 4.5.0
 
 
 class AllowedStreamIDs(IntEnum):
@@ -150,6 +152,8 @@ class H2ConnectionStateMachine:
             (None, ConnectionState.CLOSED),
         (ConnectionState.IDLE, ConnectionInputs.RECV_GOAWAY):
             (None, ConnectionState.CLOSED),
+        (ConnectionState.IDLE, ConnectionInputs.INITIATE_GRACEFUL_SHUTDOWN):
+            (None, ConnectionState.GRACEFUL_SHUTDOWN),
         (ConnectionState.IDLE, ConnectionInputs.SEND_PRIORITY):
             (None, ConnectionState.IDLE),
         (ConnectionState.IDLE, ConnectionInputs.RECV_PRIORITY):
@@ -181,7 +185,10 @@ class H2ConnectionStateMachine:
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.RECV_DATA):
             (None, ConnectionState.CLIENT_OPEN),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.RECV_GOAWAY):
-            (None, ConnectionState.CLOSED),
+            (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.CLIENT_OPEN,
+            ConnectionInputs.INITIATE_GRACEFUL_SHUTDOWN):
+                (None, ConnectionState.GRACEFUL_SHUTDOWN),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.RECV_WINDOW_UPDATE):
             (None, ConnectionState.CLIENT_OPEN),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.RECV_PING):
@@ -220,7 +227,10 @@ class H2ConnectionStateMachine:
         (ConnectionState.SERVER_OPEN, ConnectionInputs.RECV_DATA):
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.RECV_GOAWAY):
-            (None, ConnectionState.CLOSED),
+            (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.SERVER_OPEN,
+            ConnectionInputs.INITIATE_GRACEFUL_SHUTDOWN):
+                (None, ConnectionState.GRACEFUL_SHUTDOWN),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.RECV_WINDOW_UPDATE):
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.RECV_PING):
@@ -239,6 +249,55 @@ class H2ConnectionStateMachine:
         (ConnectionState.SERVER_OPEN,
             ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
                 (None, ConnectionState.SERVER_OPEN),
+
+        # State: graceful shutdown. The connection is draining: existing
+        # streams may continue to send and receive frames, and connection-
+        # level control frames are still handled, but no new streams may be
+        # opened. A final GOAWAY frame (sent or received) completes the
+        # shutdown.
+        (ConnectionState.GRACEFUL_SHUTDOWN, ConnectionInputs.SEND_HEADERS):
+            (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN, ConnectionInputs.RECV_HEADERS):
+            (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN, ConnectionInputs.SEND_DATA):
+            (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN, ConnectionInputs.RECV_DATA):
+            (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN,
+            ConnectionInputs.SEND_WINDOW_UPDATE):
+                (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN,
+            ConnectionInputs.RECV_WINDOW_UPDATE):
+                (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN, ConnectionInputs.SEND_PING):
+            (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN, ConnectionInputs.RECV_PING):
+            (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN, ConnectionInputs.SEND_SETTINGS):
+            (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN, ConnectionInputs.RECV_SETTINGS):
+            (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN, ConnectionInputs.SEND_RST_STREAM):
+            (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN, ConnectionInputs.RECV_RST_STREAM):
+            (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN, ConnectionInputs.SEND_PRIORITY):
+            (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN, ConnectionInputs.RECV_PRIORITY):
+            (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN,
+            ConnectionInputs.RECV_PUSH_PROMISE):
+                (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN, ConnectionInputs.SEND_GOAWAY):
+            (None, ConnectionState.CLOSED),
+        (ConnectionState.GRACEFUL_SHUTDOWN, ConnectionInputs.RECV_GOAWAY):
+            (None, ConnectionState.CLOSED),
+        (ConnectionState.GRACEFUL_SHUTDOWN,
+            ConnectionInputs.SEND_ALTERNATIVE_SERVICE):
+                (None, ConnectionState.GRACEFUL_SHUTDOWN),
+        (ConnectionState.GRACEFUL_SHUTDOWN,
+            ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
+                (None, ConnectionState.GRACEFUL_SHUTDOWN),
 
         # State: closed
         (ConnectionState.CLOSED, ConnectionInputs.SEND_GOAWAY):
@@ -329,6 +388,13 @@ class H2Connection:
         self.highest_outbound_stream_id = 0
         self.encoder = Encoder()
         self.decoder = Decoder()
+
+        # The last stream ID sent in the most recent GOAWAY frame emitted
+        # on this connection, or None if no GOAWAY frame has been sent yet.
+        # Successive GOAWAY frames must not raise this value: streams that
+        # were already rejected by a GOAWAY frame must not be retroactively
+        # counted as accepted (RFC 7540 Section 6.8).
+        self._goaway_last_stream_id: int | None = None
 
         # This won't always actually do anything: for versions of HPACK older
         # than 2.3.0 it does nothing. However, we have to try!
@@ -459,6 +525,28 @@ class H2Connection:
         """
         inbound_numbers = int(not self.config.client_side)
         return self._open_streams(inbound_numbers)
+
+    @property
+    def graceful_shutdown_in_progress(self) -> bool:
+        """
+        Whether the connection is currently draining as part of a graceful
+        shutdown: that is, a GOAWAY frame has been sent or received, but
+        the final GOAWAY frame that completes the shutdown has not been
+        sent yet.
+
+        While this is ``True``, existing streams may continue to be used,
+        but no new streams may be opened. Callers performing a graceful
+        shutdown can use :meth:`open_inbound_streams
+        <h2.connection.H2Connection.open_inbound_streams>` (and
+        :meth:`open_outbound_streams
+        <h2.connection.H2Connection.open_outbound_streams>`) to determine
+        when the connection has drained, at which point they should call
+        :meth:`close_connection <h2.connection.H2Connection.close_connection>`
+        to send the final GOAWAY frame.
+
+        .. versionadded:: 4.5.0
+        """
+        return self.state_machine.state is ConnectionState.GRACEFUL_SHUTDOWN
 
     @property
     def inbound_flow_control_window(self) -> int:
@@ -794,6 +882,11 @@ class H2Connection:
 
         # Check we can open the stream.
         if stream_id not in self.streams:
+            if (self.state_machine.state is
+                    ConnectionState.GRACEFUL_SHUTDOWN):
+                msg = "Cannot open new streams during graceful shutdown"
+                raise ProtocolError(msg)
+
             max_open_streams = self.remote_settings.max_concurrent_streams
             value = self.open_outbound_streams # take a copy due to the property accessor having side affects
             if (value + 1) > max_open_streams:
@@ -1085,6 +1178,15 @@ class H2Connection:
         .. versionchanged:: 2.4.0
            Added ``additional_data`` and ``last_stream_id`` arguments.
 
+        .. versionchanged:: 4.5.0
+           When called while a graceful shutdown is in progress (see
+           :meth:`initiate_graceful_shutdown
+           <h2.connection.H2Connection.initiate_graceful_shutdown>`), this
+           emits the final GOAWAY frame that completes the shutdown. The
+           ``last_stream_id`` of any GOAWAY frame must not exceed the value
+           sent in a previous GOAWAY frame: streams that were already
+           rejected must not be retroactively counted as accepted.
+
         :param error_code: (optional) The error code to send in the GOAWAY
             frame.
         :param additional_data: (optional) Additional debug data indicating
@@ -1094,7 +1196,6 @@ class H2Connection:
         :returns: Nothing
         """
         self.config.logger.debug("Close connection")
-        self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
 
         # Additional_data must be bytes
         if additional_data is not None:
@@ -1103,6 +1204,9 @@ class H2Connection:
         if last_stream_id is None:
             last_stream_id = self.highest_inbound_stream_id
 
+        self._validate_goaway_last_stream_id(last_stream_id)
+        self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
+
         f = GoAwayFrame(
             stream_id=0,
             last_stream_id=last_stream_id,
@@ -1110,6 +1214,76 @@ class H2Connection:
             additional_data=(additional_data or b""),
         )
         self._prepare_for_sending([f])
+        self._goaway_last_stream_id = last_stream_id
+
+    def initiate_graceful_shutdown(self) -> None:
+        """
+        Begin a graceful shutdown of the connection, emitting the first of
+        two GOAWAY frames.
+
+        This implements the two-phase shutdown pattern described in
+        `RFC 7540 Section 6.8
+        <https://tools.ietf.org/html/rfc7540#section-6.8>`_: the initial
+        GOAWAY frame carries a ``last_stream_id`` of 2**31 - 1 and the
+        ``NO_ERROR`` error code, which tells the remote peer that shutdown
+        is imminent and that it must not open new streams, without
+        rejecting any streams it may already have in flight.
+
+        After this method is called the connection enters a draining state
+        (see :meth:`graceful_shutdown_in_progress
+        <h2.connection.H2Connection.graceful_shutdown_in_progress>`):
+        existing streams may continue to send and receive data, update
+        flow control windows, and end, and control frames such as PING and
+        SETTINGS are still handled, but new streams are rejected. New
+        inbound streams are refused with ``REFUSED_STREAM`` so that they
+        are not counted as accepted by the final GOAWAY frame.
+
+        This method does not wait for the connection to drain: as a
+        sans-I/O library, h2 leaves all application-level waiting to the
+        caller. The caller should poll :meth:`open_inbound_streams
+        <h2.connection.H2Connection.open_inbound_streams>` (and, where
+        relevant, :meth:`open_outbound_streams
+        <h2.connection.H2Connection.open_outbound_streams>`) until the
+        connection has drained, and then call :meth:`close_connection
+        <h2.connection.H2Connection.close_connection>` to emit the final
+        GOAWAY frame carrying the actual last accepted stream ID.
+
+        .. versionadded:: 4.5.0
+
+        :returns: Nothing
+        """
+        self.config.logger.debug("Initiate graceful shutdown of connection")
+        self.state_machine.process_input(
+            ConnectionInputs.INITIATE_GRACEFUL_SHUTDOWN,
+        )
+
+        f = GoAwayFrame(
+            stream_id=0,
+            last_stream_id=self.HIGHEST_ALLOWED_STREAM_ID,
+            error_code=ErrorCodes.NO_ERROR,
+        )
+        self._prepare_for_sending([f])
+        self._goaway_last_stream_id = self.HIGHEST_ALLOWED_STREAM_ID
+
+    def _validate_goaway_last_stream_id(self, last_stream_id: int) -> None:
+        """
+        Ensures that a GOAWAY frame about to be sent does not raise the
+        last stream ID above the value sent in a previous GOAWAY frame.
+        Streams with IDs above a previously sent last stream ID have
+        already been rejected, and must not be retroactively counted as
+        accepted (RFC 7540 Section 6.8).
+        """
+        if (
+            self._goaway_last_stream_id is not None
+            and last_stream_id > self._goaway_last_stream_id
+        ):
+            msg = (
+                f"GOAWAY last_stream_id {last_stream_id} exceeds the last "
+                f"stream ID {self._goaway_last_stream_id} sent in a "
+                f"previous GOAWAY frame: streams that were already "
+                f"rejected cannot be re-accepted"
+            )
+            raise ProtocolError(msg)
 
     def update_settings(self, new_settings: dict[SettingCodes | int, int]) -> None:
         """
@@ -1591,11 +1765,28 @@ class H2Connection:
         f.error_code = error_code
         self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
         self._prepare_for_sending([f])
+        self._goaway_last_stream_id = f.last_stream_id
 
     def _receive_headers_frame(self, frame: HeadersFrame) -> tuple[list[Frame], list[Event]]:
         """
         Receive a headers frame on the connection.
         """
+        # While gracefully shutting down, new inbound streams are refused:
+        # the GOAWAY frame we sent prohibits the peer from opening them,
+        # and accepting them here would cause the final GOAWAY frame to
+        # count already-rejected streams as accepted. The header block must
+        # still be decoded to keep the HPACK decoder state in sync.
+        if (
+            frame.stream_id not in self.streams
+            and self.state_machine.state is ConnectionState.GRACEFUL_SHUTDOWN
+            and not self._stream_id_is_outbound(frame.stream_id)
+            and frame.stream_id > self.highest_inbound_stream_id
+        ):
+            _decode_headers(self.decoder, frame.data)
+            f = RstStreamFrame(frame.stream_id)
+            f.error_code = ErrorCodes.REFUSED_STREAM
+            return [f], []
+
         # If necessary, check we can open the stream. Also validate that the
         # stream ID is valid.
         if frame.stream_id not in self.streams:
@@ -1898,8 +2089,12 @@ class H2Connection:
             ConnectionInputs.RECV_GOAWAY,
         )
 
-        # Clear the outbound data buffer: we cannot send further data now.
-        self.clear_outbound_data_buffer()
+        if self.state_machine.state is ConnectionState.CLOSED:
+            # The connection is fully closed: we cannot send further data
+            # now. If we are draining instead (a graceful shutdown is in
+            # progress), existing streams may keep sending, so the buffer
+            # must be preserved.
+            self.clear_outbound_data_buffer()
 
         # Fire an appropriate ConnectionTerminated event.
         new_event = ConnectionTerminated()

@@ -1,6 +1,30 @@
 Release History
 ===============
 
+Unreleased
+----------
+
+**API Changes (Backward Compatible)**
+
+- Added support for graceful connection shutdown using the two-phase GOAWAY
+  pattern from RFC 7540 Section 6.8. The new
+  ``H2Connection.initiate_graceful_shutdown`` method emits an initial GOAWAY
+  frame with a last stream ID of 2**31 - 1, moving the connection to a new
+  explicit ``GRACEFUL_SHUTDOWN`` state in which existing streams can still
+  send and receive data, update flow control windows, and end, and control
+  frames such as PING and SETTINGS are still handled, while new streams are
+  rejected. New inbound streams arriving during the drain are refused with
+  ``REFUSED_STREAM`` so they are not counted as accepted. The new
+  ``H2Connection.graceful_shutdown_in_progress`` property lets callers
+  observe the drain; once the connection has drained, calling
+  ``H2Connection.close_connection`` emits the final GOAWAY frame with the
+  actual last accepted stream ID. The last stream ID of successive GOAWAY
+  frames may no longer increase, so already-rejected streams cannot be
+  re-accepted. Receiving a GOAWAY frame with open streams now also drains
+  the connection instead of immediately discarding the outbound buffer.
+  Calling ``close_connection`` directly retains its previous immediate
+  semantics.
+
 4.4.1 (2026-08-03)
 ------------------
 
