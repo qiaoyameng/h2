@@ -1,6 +1,19 @@
 Release History
 ===============
 
+Unreleased
+----------
+
+**API Changes (Backward Compatible)**
+
+- Added pluggable HPACK codec support: ``H2Configuration`` now accepts
+  ``encoder_factory`` and ``decoder_factory`` callables, and the new
+  ``h2.codec`` module defines the minimal ``EncoderProtocol`` and
+  ``DecoderProtocol`` interfaces that custom implementations must satisfy.
+  Each ``H2Connection`` builds its codecs through these factories, detects
+  codec instances shared across connections, and maps custom codec errors
+  onto h2's public exceptions.
+
 4.4.1 (2026-08-03)
 ------------------
 

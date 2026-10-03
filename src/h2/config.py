@@ -7,7 +7,12 @@ Objects for controlling the configuration of the HTTP/2 stack.
 from __future__ import annotations
 
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from .codec import default_decoder_factory, default_encoder_factory
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .codec import DecoderFactory, EncoderFactory
 
 
 class _BooleanConfigOption:
@@ -149,6 +154,30 @@ class H2Configuration:
         .. versionadded:: 2.6.0
 
     :type logger: ``logging.Logger``
+
+    :param encoder_factory: A zero-argument callable that returns a fresh
+        HPACK encoder satisfying
+        :class:`EncoderProtocol <h2.codec.EncoderProtocol>`. Each
+        :class:`H2Connection <h2.connection.H2Connection>` built with this
+        configuration calls the factory exactly once, at construction time.
+        The returned encoder must not be shared with any other live
+        connection. Defaults to a factory backed by the ``hpack`` package.
+
+        .. versionadded:: 4.5.0
+
+    :type encoder_factory: ``Callable[[], h2.codec.EncoderProtocol]``
+
+    :param decoder_factory: A zero-argument callable that returns a fresh
+        HPACK decoder satisfying
+        :class:`DecoderProtocol <h2.codec.DecoderProtocol>`. Each
+        :class:`H2Connection <h2.connection.H2Connection>` built with this
+        configuration calls the factory exactly once, at construction time.
+        The returned decoder must not be shared with any other live
+        connection. Defaults to a factory backed by the ``hpack`` package.
+
+        .. versionadded:: 4.5.0
+
+    :type decoder_factory: ``Callable[[], h2.codec.DecoderProtocol]``
     """
 
     client_side = _BooleanConfigOption("client_side")
@@ -176,7 +205,9 @@ class H2Configuration:
                  split_outbound_cookies: bool = False,
                  validate_inbound_headers: bool = True,
                  normalize_inbound_headers: bool = True,
-                 logger: DummyLogger | OutputLogger | None = None) -> None:
+                 logger: DummyLogger | OutputLogger | None = None,
+                 encoder_factory: EncoderFactory | None = None,
+                 decoder_factory: DecoderFactory | None = None) -> None:
         self.client_side = client_side
         self.header_encoding = header_encoding
         self.validate_outbound_headers = validate_outbound_headers
@@ -185,6 +216,8 @@ class H2Configuration:
         self.validate_inbound_headers = validate_inbound_headers
         self.normalize_inbound_headers = normalize_inbound_headers
         self.logger = logger or DummyLogger(__name__)
+        self.encoder_factory = encoder_factory
+        self.decoder_factory = decoder_factory
 
     @property
     def header_encoding(self) -> bool | str | None:
@@ -210,3 +243,50 @@ class H2Configuration:
             msg = "header_encoding cannot be True"
             raise ValueError(msg)
         self._header_encoding = value
+
+    @property
+    def encoder_factory(self) -> EncoderFactory:
+        """
+        The factory used to build the HPACK encoder for each connection
+        created with this configuration. Defaults to a factory backed by
+        the ``hpack`` package.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._encoder_factory
+
+    @encoder_factory.setter
+    def encoder_factory(self, value: EncoderFactory | None) -> None:
+        """
+        Enforces constraints on the encoder factory.
+        """
+        if value is None:
+            value = default_encoder_factory
+        if not callable(value):
+            msg = "encoder_factory must be callable"
+            raise ValueError(msg)  # noqa: TRY004
+        self._encoder_factory = value
+
+    @property
+    def decoder_factory(self) -> DecoderFactory:
+        """
+        The factory used to build the HPACK decoder for each connection
+        created with this configuration. Defaults to a factory backed by
+        the ``hpack`` package.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._decoder_factory
+
+    @decoder_factory.setter
+    def decoder_factory(self, value: DecoderFactory | None) -> None:
+        """
+        Enforces constraints on the decoder factory.
+        """
+        if value is None:
+            value = default_decoder_factory
+        if not callable(value):
+            msg = "decoder_factory must be callable"
+            raise ValueError(msg)  # noqa: TRY004
+        self._decoder_factory = value
+

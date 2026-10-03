@@ -27,6 +27,20 @@ Configuration
    :members:
 
 
+HPACK Codecs
+------------
+
+.. autoclass:: h2.codec.EncoderProtocol
+   :members:
+
+.. autoclass:: h2.codec.DecoderProtocol
+   :members:
+
+.. autofunction:: h2.codec.default_encoder_factory
+
+.. autofunction:: h2.codec.default_decoder_factory
+
+
 .. _h2-events-api:
 
 Events

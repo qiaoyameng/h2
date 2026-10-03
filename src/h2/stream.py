@@ -48,9 +48,9 @@ from .windows import WindowManager
 if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Callable, Generator, Iterable
 
-    from hpack.hpack import Encoder
     from hpack.struct import Header, HeaderWeaklyTyped
 
+    from .codec import EncoderProtocol
     from .config import H2Configuration
 
 
@@ -857,7 +857,7 @@ class H2Stream:
 
     def send_headers(self,
                      headers: Iterable[HeaderWeaklyTyped],
-                     encoder: Encoder,
+                     encoder: EncoderProtocol,
                      end_stream: bool = False) -> list[HeadersFrame | ContinuationFrame | PushPromiseFrame]:
         """
         Returns a list of HEADERS/CONTINUATION frames to emit as either headers
@@ -913,7 +913,7 @@ class H2Stream:
     def push_stream_in_band(self,
                             related_stream_id: int,
                             headers: Iterable[HeaderWeaklyTyped],
-                            encoder: Encoder) -> list[HeadersFrame | ContinuationFrame | PushPromiseFrame]:
+                            encoder: EncoderProtocol) -> list[HeadersFrame | ContinuationFrame | PushPromiseFrame]:
         """
         Returns a list of PUSH_PROMISE/CONTINUATION frames to emit as a pushed
         stream header. Called on the stream that has the PUSH_PROMISE frame
@@ -1284,7 +1284,7 @@ class H2Stream:
 
     def _build_headers_frames(self,
                               headers: Iterable[Header],
-                              encoder: Encoder,
+                              encoder: EncoderProtocol,
                               first_frame: HeadersFrame | PushPromiseFrame,
                               hdr_validation_flags: HeaderValidationFlags) \
             -> list[HeadersFrame | ContinuationFrame | PushPromiseFrame]:
@@ -1306,7 +1306,14 @@ class H2Stream:
                 headers, hdr_validation_flags,
             )
 
-        encoded_headers = encoder.encode(headers)
+        try:
+            encoded_headers = encoder.encode(headers)
+        except Exception as e:  # noqa: BLE001
+            # Custom encoders may raise their own exception types: map them
+            # onto h2's public exceptions rather than leaking them to
+            # callers.
+            msg = f"Error encoding header block: {e}"
+            raise ProtocolError(msg) from e
 
         # Slice into blocks of max_outbound_frame_size. Be careful with this:
         # it only works right because we never send padded frames or priority

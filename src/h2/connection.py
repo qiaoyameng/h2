@@ -11,7 +11,6 @@ from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any
 
 from hpack.exceptions import HPACKError, OversizedHeaderListError
-from hpack.hpack import Decoder, Encoder
 from hyperframe.exceptions import InvalidPaddingError
 from hyperframe.frame import (
     AltSvcFrame,
@@ -29,6 +28,7 @@ from hyperframe.frame import (
     WindowUpdateFrame,
 )
 
+from .codec import DecoderProtocol, build_decoder, build_encoder
 from .config import H2Configuration
 from .errors import ErrorCodes, _error_code_from_int
 from .events import (
@@ -327,17 +327,21 @@ class H2Connection:
         self.streams: dict[int, H2Stream] = {}
         self.highest_inbound_stream_id = 0
         self.highest_outbound_stream_id = 0
-        self.encoder = Encoder()
-        self.decoder = Decoder()
-
-        # This won't always actually do anything: for versions of HPACK older
-        # than 2.3.0 it does nothing. However, we have to try!
-        self.decoder.max_header_list_size = self.DEFAULT_MAX_HEADER_LIST_SIZE
 
         #: The configuration for this HTTP/2 connection object.
         #:
         #: .. versionadded:: 2.5.0
         self.config = config or H2Configuration(client_side=True)
+
+        # The HPACK codec pair. These are built by the factories provided
+        # by the configuration, which guarantees that each connection owns
+        # its own stateful encoder and decoder.
+        #:
+        #: .. versionchanged:: 4.5.0
+        #:    Built via ``config.encoder_factory`` and
+        #:    ``config.decoder_factory``.
+        self.encoder = build_encoder(self.config.encoder_factory)
+        self.decoder = build_decoder(self.config.decoder_factory)
 
         # Objects that store settings, including defaults.
         #
@@ -361,6 +365,19 @@ class H2Connection:
             },
         )
         self.remote_settings = Settings(client=not self.config.client_side)
+
+        # Synchronize the codec limits with the initial settings in both
+        # directions. The outbound (encoder) table size is constrained by
+        # the peer's initial SETTINGS_HEADER_TABLE_SIZE, while the inbound
+        # (decoder) limits reflect the values we advertise in our own
+        # settings. Later changes are applied when the relevant SETTINGS
+        # frames are acknowledged.
+        self.encoder.header_table_size = self.remote_settings.header_table_size
+        self.decoder.max_header_list_size = (
+            self.local_settings.max_header_list_size
+            or self.DEFAULT_MAX_HEADER_LIST_SIZE
+        )
+        self.decoder.max_allowed_table_size = self.local_settings.header_table_size
 
         # The current value of the connection flow control windows on the
         # connection.
@@ -2093,16 +2110,19 @@ def _add_frame_priority(frame: PriorityFrame | HeadersFrame,
     return frame
 
 
-def _decode_headers(decoder: Decoder, encoded_header_block: bytes) -> Iterable[Header]:
+def _decode_headers(decoder: DecoderProtocol, encoded_header_block: bytes) -> Iterable[Header]:
     """
-    Decode a HPACK-encoded header block, translating HPACK exceptions into
+    Decode a HPACK-encoded header block, translating codec exceptions into
     sensible h2 errors.
 
     This only ever returns bytestring headers: h2 may emit them as
     unicode later, but internally it processes them as bytestrings only.
     """
     try:
-        return decoder.decode(encoded_header_block, raw=True)
+        # Materialize the header list eagerly: decoders may return lazy
+        # iterables, and a failure partway through must not allow a
+        # partially decoded header block to escape.
+        return list(decoder.decode(encoded_header_block, raw=True))
     except OversizedHeaderListError as e:
         # This is a symptom of a HPACK bomb attack: the user has
         # disregarded our requirements on how large a header block we'll
@@ -2113,5 +2133,10 @@ def _decode_headers(decoder: Decoder, encoded_header_block: bytes) -> Iterable[H
         # We should only need HPACKError here, but versions of HPACK older
         # than 2.1.0 throw all three others as well. For maximum
         # compatibility, catch all of them.
+        msg = f"Error decoding header block: {e}"
+        raise ProtocolError(msg) from e
+    except Exception as e:  # noqa: BLE001
+        # Custom decoders may raise their own exception types: map them
+        # onto h2's public exceptions rather than leaking them to callers.
         msg = f"Error decoding header block: {e}"
         raise ProtocolError(msg) from e
