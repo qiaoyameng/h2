@@ -51,6 +51,12 @@ class TooManyStreamsError(ProtocolError):
     """
 
 
+class TooManyPingsError(H2Error):
+    """
+    An attempt was made to start a PING when the pending PING limit has been
+    reached.
+    """
+
 
 class FlowControlError(ProtocolError):
     """
