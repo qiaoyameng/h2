@@ -102,6 +102,10 @@ Exceptions
    :show-inheritance:
    :members:
 
+.. autoclass:: h2.exceptions.InboundBufferOverflowError
+   :show-inheritance:
+   :members:
+
 
 Protocol Errors
 ~~~~~~~~~~~~~~~

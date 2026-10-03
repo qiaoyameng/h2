@@ -63,6 +63,32 @@ class FrameBuffer:
 
         self._data += data_view
 
+    def __len__(self) -> int:
+        """
+        The number of unprocessed bytes currently held in the buffer.
+        """
+        return len(self._data)
+
+    @property
+    def has_pending_frame(self) -> bool:
+        """
+        ``True`` if the buffer holds at least one complete frame that could
+        be parsed immediately, ``False`` if more data from the peer is
+        required before any further frame can be produced.
+        """
+        if self._preamble_len or len(self._data) < 9:
+            return False
+
+        try:
+            _, length = Frame.parse_frame_header(memoryview(self._data[:9]))
+        except (InvalidDataError, InvalidFrameError):
+            # The buffered bytes do not form a valid frame header, but there
+            # is enough data that attempting to process it would make
+            # progress (by raising an error).
+            return True
+
+        return len(self._data) >= 9 + length
+
     def _validate_frame_length(self, length: int) -> None:
         """
         Confirm that the frame is an appropriate length.
@@ -119,15 +145,18 @@ class FrameBuffer:
 
         return f
 
-    # The methods below support the iterator protocol.
-    def __iter__(self) -> FrameBuffer:
-        return self
-
-    def __next__(self) -> Frame:
+    def _next_raw_frame(self) -> Frame | None:
+        """
+        Parse a single raw frame out of the buffer, removing the parsed bytes
+        from it. Returns ``None``, leaving the buffer untouched, if there
+        isn't enough buffered data to complete the next frame. Does not
+        perform any header block reassembly: CONTINUATION frames are returned
+        as-is.
+        """
         # First, check that we have enough data to successfully parse the
         # next frame header. If not, bail. Otherwise, parse it.
         if len(self._data) < 9:
-            raise StopIteration
+            return None
 
         try:
             f, length = Frame.parse_frame_header(memoryview(self._data[:9]))
@@ -138,7 +167,7 @@ class FrameBuffer:
         # Next, check that we have enough length to parse the frame body. If
         # not, bail, leaving the frame header data in the buffer for next time.
         if len(self._data) < length + 9:
-            raise StopIteration
+            return None
 
         # Confirm the frame has an appropriate length.
         self._validate_frame_length(length)
@@ -164,8 +193,34 @@ class FrameBuffer:
         # front amortized O(1) per byte rather than O(len) per frame.
         del self._data[:9+length]
 
+        return f
+
+    def next_frame(self) -> tuple[Frame | None, bool]:
+        """
+        Consume a single raw frame from the buffer.
+
+        Returns a tuple of a frame and a boolean. The boolean is ``True`` if
+        a raw frame was consumed from the buffer, and ``False`` if more data
+        is needed before any further frame can be parsed, in which case the
+        buffer is left unchanged. The returned frame is ``None`` when the
+        consumed raw frame was absorbed into an in-progress header block (a
+        CONTINUATION frame): such frames still count as consumed.
+        """
+        raw_frame = self._next_raw_frame()
+        if raw_frame is None:
+            return None, False
+
         # Pass the frame through the header buffer.
-        new_frame = self._update_header_buffer(f)
+        return self._update_header_buffer(raw_frame), True
+
+    # The methods below support the iterator protocol.
+    def __iter__(self) -> FrameBuffer:
+        return self
+
+    def __next__(self) -> Frame:
+        new_frame, consumed = self.next_frame()
+        if not consumed:
+            raise StopIteration
 
         # If we got a frame we didn't understand or shouldn't yield, rather
         # than return None it'd be better if we just tried to get the next

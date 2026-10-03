@@ -1,6 +1,20 @@
 Release History
 ===============
 
+4.5.0 (unreleased)
+------------------
+
+**API Changes (Backward Compatible)**
+
+- Added ``H2Connection.receive_data_budget``, an inbound processing entry
+  point that parses and dispatches at most a caller-provided number of
+  frames per call (CONTINUATION frames included), keeping unprocessed bytes
+  buffered for the next call and reporting whether more processable data
+  remains. The inbound buffer used by this entry point is bounded by the new
+  ``H2Connection.max_inbound_buffer_size`` attribute; exceeding it raises
+  the new ``h2.exceptions.InboundBufferOverflowError``. The behaviour of
+  ``H2Connection.receive_data`` is unchanged.
+
 4.4.1 (2026-08-03)
 ------------------
 

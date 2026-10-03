@@ -51,6 +51,7 @@ from .exceptions import (
     DenialOfServiceError,
     FlowControlError,
     FrameTooLargeError,
+    InboundBufferOverflowError,
     NoAvailableStreamIDError,
     NoSuchStreamError,
     ProtocolError,
@@ -322,6 +323,12 @@ class H2Connection:
     # Keep in memory limited amount of results for streams closes
     MAX_CLOSED_STREAMS = 2**16
 
+    # The default maximum number of unprocessed bytes the inbound buffer may
+    # hold before ``receive_data_budget`` refuses to accept more data. Chosen
+    # to comfortably hold at least one maximum-size frame alongside a partial
+    # one.
+    DEFAULT_MAX_INBOUND_BUFFER_SIZE = 2**24 + 2**14
+
     def __init__(self, config: H2Configuration | None = None) -> None:
         self.state_machine = H2ConnectionStateMachine()
         self.streams: dict[int, H2Stream] = {}
@@ -378,6 +385,12 @@ class H2Connection:
 
         # Buffer for incoming data.
         self.incoming_buffer = FrameBuffer(server=not self.config.client_side)
+
+        #: The maximum number of unprocessed bytes the inbound buffer may
+        #: hold before ``receive_data_budget`` refuses to accept more data.
+        #:
+        #: .. versionadded:: 4.5.0
+        self.max_inbound_buffer_size = self.DEFAULT_MAX_INBOUND_BUFFER_SIZE
 
         # A private variable to store a sequence of received header frames
         # until completion.
@@ -1531,6 +1544,86 @@ class H2Connection:
             raise
 
         return events
+
+    def receive_data_budget(self, data: Buffer, budget: int) -> tuple[list[Event], bool]:
+        """
+        Pass some received HTTP/2 data to the connection for handling,
+        processing at most ``budget`` frames.
+
+        Unlike ``receive_data``, this method bounds the amount of work
+        performed in a single call: at most ``budget`` frames are parsed and
+        dispatched. Every parsed frame counts against the budget, including
+        CONTINUATION frames that are absorbed into an in-progress header
+        block. Any bytes that cannot or may not yet be processed remain
+        buffered and will be handled by a later call to this method (which
+        may pass empty data to keep draining the buffer) or to
+        ``receive_data``. Connection state such as partially received
+        frames, the connection preamble, and header blocks spanning
+        multiple frames is preserved between calls.
+
+        The inbound buffer holds at most ``max_inbound_buffer_size``
+        unprocessed bytes: if adding ``data`` would exceed that limit, an
+        :class:`InboundBufferOverflowError
+        <h2.exceptions.InboundBufferOverflowError>` is raised and the buffer
+        is left unchanged.
+
+        .. versionadded:: 4.5.0
+
+        :param data: The data received from the remote peer on the network.
+        :type data: An object implementing the buffer protocol.
+        :param budget: The maximum number of frames to process in this call.
+        :type budget: ``int``
+        :returns: A tuple of the list of events triggered by the processed
+            frames, and a boolean that is ``True`` if the buffer still holds
+            at least one complete frame (call this method again to keep
+            making progress) or ``False`` if more bytes are needed from the
+            remote peer.
+        """
+        if budget < 0:
+            msg = f"budget must be non-negative, got {budget}"
+            raise ValueError(msg)
+
+        self.config.logger.trace(
+            "Process received data on connection with frame budget %d. "
+            "Received data: %r", budget, data,
+        )
+
+        buffered = len(self.incoming_buffer)
+        incoming = len(memoryview(data))
+        if buffered + incoming > self.max_inbound_buffer_size:
+            msg = (
+                f"Inbound buffer limit of {self.max_inbound_buffer_size} "
+                f"bytes would be exceeded: {buffered} bytes already "
+                f"buffered, {incoming} new bytes received."
+            )
+            raise InboundBufferOverflowError(msg)
+
+        events: list[Event] = []
+        self.incoming_buffer.add_data(data)
+        self.incoming_buffer.max_frame_size = self.max_inbound_frame_size
+
+        frames_processed = 0
+        try:
+            while frames_processed < budget:
+                frame, consumed = self.incoming_buffer.next_frame()
+                if not consumed:
+                    break
+                frames_processed += 1
+                if frame is not None:
+                    events.extend(self._receive_frame(frame))
+        except InvalidPaddingError as e:
+            self._terminate_connection(ErrorCodes.PROTOCOL_ERROR)
+            msg = "Received frame with invalid padding."
+            raise ProtocolError(msg) from e
+        except ProtocolError as e:
+            # For whatever reason, receiving the frame caused a protocol
+            # error. We should prepare to emit a GoAway frame before throwing
+            # the exception up further. No need for an event: the exception
+            # will do fine.
+            self._terminate_connection(e.error_code)
+            raise
+
+        return events, self.incoming_buffer.has_pending_frame
 
     def _receive_frame(self, frame: Frame) -> list[Event]:
         """

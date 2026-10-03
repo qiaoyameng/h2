@@ -192,3 +192,13 @@ class DenialOfServiceError(ProtocolError):
     #: The error code corresponds to this kind of
     #: :class:`ProtocolError <h2.exceptions.ProtocolError>`
     error_code = ErrorCodes.ENHANCE_YOUR_CALM
+
+
+class InboundBufferOverflowError(H2Error):
+    """
+    The inbound data buffer would exceed its configured maximum size, so the
+    received data was rejected and not added to the buffer. The connection
+    remains usable: the caller may process the buffered data and retry.
+
+    .. versionadded:: 4.5.0
+    """
