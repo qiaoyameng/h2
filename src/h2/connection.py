@@ -7,6 +7,8 @@ An implementation of a HTTP/2 connection.
 from __future__ import annotations
 
 import base64
+import struct
+from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any
 
@@ -53,10 +55,13 @@ from .exceptions import (
     FrameTooLargeError,
     NoAvailableStreamIDError,
     NoSuchStreamError,
+    PingProbeConnectionClosedError,
+    PingProbeTimeoutError,
     ProtocolError,
     RFC1122Error,
     StreamClosedError,
     StreamIDTooLowError,
+    TooManyPingProbesError,
     TooManyStreamsError,
 )
 from .frame_buffer import FrameBuffer
@@ -71,6 +76,58 @@ if TYPE_CHECKING:  # pragma: no cover
     from hpack.struct import Header, HeaderWeaklyTyped
 
     from ._typing import Buffer
+
+
+@dataclass(eq=False)
+class PingProbe:
+    """
+    A handle for an outstanding PING acknowledgement.
+    """
+
+    ping_data: bytes
+    started_at: float
+    deadline: float | None
+    _completed: bool = False
+    _result: bool | None = None
+    _rtt: float | None = None
+    _error: Exception | None = None
+
+    @property
+    def completed(self) -> bool:
+        """Whether this probe has completed exactly once."""
+        return self._completed
+
+    @property
+    def done(self) -> bool:
+        """Alias for :attr:`completed`."""
+        return self._completed
+
+    @property
+    def result(self) -> bool | None:
+        """``True`` after an ACK, ``False`` after failure, otherwise ``None``."""
+        return self._result
+
+    @property
+    def rtt(self) -> float | None:
+        """The monotonic round-trip time, or ``None`` until an ACK completes."""
+        return self._rtt
+
+    @property
+    def error(self) -> Exception | None:
+        """The terminal failure, or ``None`` when the probe is not failed."""
+        return self._error
+
+    def _complete(self, *, result: bool, rtt: float | None = None, error: Exception | None = None) -> bool:
+        if self._completed:
+            return False
+        self._completed = True
+        self._result = result
+        self._rtt = rtt
+        self._error = error
+        return True
+
+
+PingHandle = PingProbe
 
 
 class ConnectionState(Enum):
@@ -322,7 +379,16 @@ class H2Connection:
     # Keep in memory limited amount of results for streams closes
     MAX_CLOSED_STREAMS = 2**16
 
-    def __init__(self, config: H2Configuration | None = None) -> None:
+    # The default limit for PING probes awaiting acknowledgement.
+    DEFAULT_MAX_PENDING_PINGS = 8
+
+    def __init__(
+        self,
+        config: H2Configuration | None = None,
+        *,
+        clock: Callable[[], float] | None = None,
+        max_pending_pings: int = DEFAULT_MAX_PENDING_PINGS,
+    ) -> None:
         self.state_machine = H2ConnectionStateMachine()
         self.streams: dict[int, H2Stream] = {}
         self.highest_inbound_stream_id = 0
@@ -385,6 +451,25 @@ class H2Connection:
 
         # Data that needs to be sent.
         self._data_to_send = bytearray()
+
+        self._clock = clock
+        self._current_time: float | None = None
+        self._next_ping_number = 0
+        self._pending_pings: dict[bytes, PingProbe] = {}
+        self._used_ping_data: set[bytes] = set()
+
+        if clock is not None and not callable(clock):
+            msg = "clock must be a callable"
+            raise ValueError(msg)
+
+        if (
+            not isinstance(max_pending_pings, int)
+            or isinstance(max_pending_pings, bool)
+            or max_pending_pings <= 0
+        ):
+            msg = "max_pending_pings must be a positive integer"
+            raise ValueError(msg)
+        self._max_pending_pings = max_pending_pings
 
         # Keeps track of how streams are closed.
         # Used to ensure that we don't blow up in the face of frames that were
@@ -1033,24 +1118,152 @@ class H2Connection:
         new_frames = new_stream.locally_pushed()
         self._prepare_for_sending(frames + new_frames)
 
-    def ping(self, opaque_data: bytes | str) -> None:
+    def _now(self) -> float:
+        if self._current_time is not None:
+            return self._current_time
+        if self._clock is None:
+            msg = "A monotonic clock is required to use PING probes"
+            raise ValueError(msg)
+        current_time = self._clock()
+        if not isinstance(current_time, (int, float)) or isinstance(current_time, bool):
+            msg = "The monotonic clock must return a number"
+            raise ValueError(msg)
+        return self._set_current_time(current_time)
+
+    def _set_current_time(self, current_time: float) -> float:
+        if self._current_time is not None and current_time < self._current_time:
+            msg = "The monotonic clock returned an earlier time"
+            raise ValueError(msg)
+        self._current_time = current_time
+        return current_time
+
+    def _new_ping_data(self) -> bytes:
+        while True:
+            ping_data = struct.pack(">Q", self._next_ping_number)
+            self._next_ping_number += 1
+            if ping_data not in self._pending_pings and ping_data not in self._used_ping_data:
+                return ping_data
+
+    def _fail_pending_pings(self, error: Exception) -> list[PingProbe]:
+        failed_probes = []
+        for ping_data, probe in list(self._pending_pings.items()):
+            del self._pending_pings[ping_data]
+            self._used_ping_data.add(ping_data)
+            if probe._complete(result=False, error=error):
+                failed_probes.append(probe)
+        return failed_probes
+
+    def advance_time(self, current_time: float | None = None) -> list[PingProbe]:
+        """
+        Advance explicit PING probe deadlines.
+
+        Pass the current monotonic time, or omit it to read the clock supplied
+        when this connection was created. Probes whose deadline has passed are
+        marked as failed. h2 does not install a timer or perform the call
+        automatically.
+        """
+        if current_time is None:
+            current_time = self._now()
+        elif not isinstance(current_time, (int, float)) or isinstance(current_time, bool):
+            msg = "current_time must be a number"
+            raise ValueError(msg)
+        elif self._current_time is not None and current_time < self._current_time:
+            msg = "current_time must not move backwards"
+            raise ValueError(msg)
+        else:
+            self._set_current_time(current_time)
+
+        timed_out_probes = []
+        for ping_data, probe in list(self._pending_pings.items()):
+            if probe.deadline is not None and probe.deadline <= current_time:
+                del self._pending_pings[ping_data]
+                self._used_ping_data.add(ping_data)
+                error = PingProbeTimeoutError("PING acknowledgement timed out")
+                if probe._complete(result=False, error=error):
+                    timed_out_probes.append(probe)
+        return timed_out_probes
+
+    def advance_ping_time(self, current_time: float | None = None) -> list[PingProbe]:
+        """Alias for :meth:`advance_time`."""
+        return self.advance_time(current_time)
+
+    def ping(
+        self,
+        opaque_data: bytes | str | None = None,
+        *,
+        timeout: float | None = None,
+        probe: bool | None = None,
+        handle: bool | None = None,
+        return_handle: bool | None = None,
+    ) -> PingProbe | None:
         """
         Send a PING frame.
 
         :param opaque_data: A bytestring of length 8 that will be sent in the
-                            PING frame.
-        :returns: Nothing
+            PING frame. When omitted, unique probe data is generated.
+        :param timeout: If provided, track the acknowledgement and fail it after
+            this many monotonic time units when :meth:`advance_time` is called.
+        :param probe: Explicitly request a :class:`PingProbe` handle without a
+            timeout.
+        :returns: A probe handle when tracking is requested, otherwise ``None``.
         """
         self.config.logger.debug("Send Ping frame")
 
-        if not isinstance(opaque_data, bytes) or len(opaque_data) != 8:
+        tracked_probe = timeout is not None
+        for option in (probe, handle, return_handle):
+            if option is not None:
+                if not isinstance(option, bool):
+                    msg = "probe must be a bool"
+                    raise ValueError(msg)
+                tracked_probe = tracked_probe or option
+
+        if opaque_data is None:
+            opaque_data = self._new_ping_data()
+        elif not isinstance(opaque_data, bytes) or len(opaque_data) != 8:
             msg = f"Invalid value for ping data: {opaque_data!r}"
             raise ValueError(msg)
+        elif opaque_data in self._pending_pings:
+            msg = "PING data must be unique while a probe is pending"
+            raise ValueError(msg)
+
+        if timeout is not None and (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or timeout <= 0
+            or timeout != timeout
+        ):
+            msg = "timeout must be a positive number"
+            raise ValueError(msg)
+
+        ping_probe: PingProbe | None = None
+        if tracked_probe:
+            if opaque_data in self._used_ping_data:
+                msg = "PING data must be unique while a probe is pending"
+                raise ValueError(msg)
+            if len(self._pending_pings) >= self._max_pending_pings:
+                msg = f"Too many pending PING probes (limit {self._max_pending_pings})"
+                raise TooManyPingProbesError(msg)
+
+            started_at = self._now()
+            deadline = started_at + timeout if timeout is not None else None
+            ping_probe = PingProbe(
+                ping_data=opaque_data,
+                started_at=started_at,
+                deadline=deadline,
+            )
+            self._pending_pings[opaque_data] = ping_probe
 
         self.state_machine.process_input(ConnectionInputs.SEND_PING)
-        f = PingFrame(0)
-        f.opaque_data = opaque_data
-        self._prepare_for_sending([f])
+        try:
+            f = PingFrame(0)
+            f.opaque_data = opaque_data
+            self._prepare_for_sending([f])
+        except Exception:
+            if ping_probe is not None:
+                self._pending_pings.pop(opaque_data, None)
+            raise
+
+        return ping_probe
 
     def reset_stream(self, stream_id: int, error_code: ErrorCodes | int = 0) -> None:
         """
@@ -1110,6 +1323,9 @@ class H2Connection:
             additional_data=(additional_data or b""),
         )
         self._prepare_for_sending([f])
+        self._fail_pending_pings(
+            PingProbeConnectionClosedError("Connection closed"),
+        )
 
     def update_settings(self, new_settings: dict[SettingCodes | int, int]) -> None:
         """
@@ -1591,6 +1807,9 @@ class H2Connection:
         f.error_code = error_code
         self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
         self._prepare_for_sending([f])
+        self._fail_pending_pings(
+            PingProbeConnectionClosedError("Connection terminated"),
+        )
 
     def _receive_headers_frame(self, frame: HeadersFrame) -> tuple[list[Frame], list[Event]]:
         """
@@ -1834,6 +2053,14 @@ class H2Connection:
         evt: PingReceived | PingAckReceived
         if "ACK" in frame.flags:
             evt = PingAckReceived(ping_data=frame.opaque_data)
+            ping_probe = self._pending_pings.pop(frame.opaque_data, None)
+            if ping_probe is not None:
+                completed_at = self._now()
+                self._used_ping_data.add(frame.opaque_data)
+                ping_probe._complete(
+                    result=True,
+                    rtt=completed_at - ping_probe.started_at,
+                )
         else:
             evt = PingReceived(ping_data=frame.opaque_data)
 
@@ -1907,6 +2134,9 @@ class H2Connection:
         new_event.last_stream_id = frame.last_stream_id
         new_event.additional_data = frame.additional_data or None
         events.append(new_event)
+        self._fail_pending_pings(
+            PingProbeConnectionClosedError("Connection terminated by peer"),
+        )
 
         return [], events
 

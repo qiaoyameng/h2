@@ -179,6 +179,30 @@ class RFC1122Error(H2Error):
     # turns out to be true, TELL HIM NOTHING.
 
 
+class PingProbeError(H2Error):
+    """
+    A PING probe failed before receiving its acknowledgement.
+    """
+
+
+class PingProbeTimeoutError(PingProbeError):
+    """
+    A PING probe was not acknowledged before its deadline.
+    """
+
+
+class PingProbeConnectionClosedError(PingProbeError):
+    """
+    A PING probe was outstanding when the connection was terminated.
+    """
+
+
+class TooManyPingProbesError(H2Error):
+    """
+    Adding another PING probe would exceed the pending probe limit.
+    """
+
+
 class DenialOfServiceError(ProtocolError):
     """
     Emitted when the remote peer exhibits a behaviour that is likely to be an
